@@ -1,0 +1,21 @@
+# Bağımlılıklar
+node_modules/
+
+# Derleme çıktısı
+dist/
+
+# Ortam değişkenleri (gizli bilgiler - asla commit'lenmez)
+.env
+.env.local
+.env.*.local
+
+# Loglar
+*.log
+npm-debug.log*
+
+# Test / hata ayıklama çıktıları
+.playwright-cli/
+
+# İşletim sistemi dosyaları
+.DS_Store
+Thumbs.db
