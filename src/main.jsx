@@ -538,6 +538,103 @@ function App({ onSignOut }) {
     doc.save(`ayes-muhasebe-${reportSlug}-${today}.pdf`);
     flash("PDF rapor indirildi.");
   };
+  const exportDebtReceipt = async (debtRow) => {
+    try {
+      const debt = normalizeDebtRow(debtRow || {});
+      if (!debt.id) { flash("Borç kaydı bulunamadı."); return; }
+      const lent = debtDirection(debt) === "lent";
+      const { total, paid, remaining } = debtAmounts(debt);
+      const receiptTitle = lent ? "Tahsilat Fişi" : "Ödeme Fişi";
+      const movementTitle = lent ? "Tahsilat Hareketleri" : "Ödeme Hareketleri";
+      const paidLabel = lent ? "Tahsil Edilen" : "Ödenen";
+      const txns = [...debt.transactions].sort((left, right) => String(left.date).localeCompare(String(right.date)));
+      const doc = new jsPDF({ orientation: "portrait", unit: "mm", format: "a4" });
+      await loadAyesFonts(doc);
+      const logo = await loadLogoDataUrl();
+      if (logo) doc.addImage(logo, "PNG", 14, 10, 26, 26);
+      doc.setFont("Ayes", "bold"); doc.setFontSize(16);
+      doc.text(pdfText(selectedCompany?.name || "AYES GROUP"), 44, 20);
+      doc.setFont("Ayes", "normal"); doc.setFontSize(10);
+      doc.text(pdfText(`${receiptTitle} · ${fullDateLabel(today)}`), 44, 27);
+      doc.text(pdfText(`${debt.creditor || ""} · ${lent ? "Verilen borç" : "Alınan borç"}`), 44, 33);
+      let y = 44;
+      doc.setFont("Ayes", "bold"); doc.setFontSize(11);
+      doc.text(pdfText("Borç Bilgileri"), 14, y);
+      autoTable(doc, {
+        startY: y + 3,
+        body: [
+          [lent ? "Borçlu" : "Alacaklı", debt.creditor || "—"],
+          ["Borç Türü", lent ? "Verilen borç (tahsil edilecek)" : "Alınan borç (ödenecek)"],
+          ["Kaynak / Açıklama", debt.source || "—"],
+          ["Borç Tarihi", debt.date ? fullDateLabel(debt.date) : "—"],
+          ["Vade", debt.due || "Açık"],
+          ["Durum", debtStatusLabel(debt)],
+        ].map((row) => row.map(pdfText)),
+        theme: "plain",
+        styles: { font: "Ayes", fontSize: 9, cellPadding: 1.5 },
+        columnStyles: { 0: { fontStyle: "bold", cellWidth: 42, textColor: [90, 110, 112] }, 1: { cellWidth: "auto" } },
+      });
+      y = doc.lastAutoTable.finalY + 8;
+      autoTable(doc, {
+        startY: y,
+        head: [[pdfText("Toplam Tutar"), pdfText(paidLabel), pdfText("Kalan")]],
+        body: [[amount(total), amount(paid), amount(remaining)].map(pdfText)],
+        styles: { font: "Ayes", fontSize: 10, halign: "center" },
+        headStyles: { fillColor: [19, 38, 48] },
+      });
+      y = doc.lastAutoTable.finalY + 8;
+      if (y > 250) { doc.addPage(); y = 15; }
+      doc.setFont("Ayes", "bold"); doc.setFontSize(11);
+      doc.text(pdfText(movementTitle), 14, y);
+      if (!txns.length) {
+        doc.setFont("Ayes", "normal"); doc.setFontSize(9); doc.setTextColor(130, 140, 142);
+        doc.text(pdfText(lent ? "Henüz tahsilat işlenmedi." : "Henüz ödeme işlenmedi."), 14, y + 7);
+        doc.setTextColor(0, 0, 0);
+        y += 12;
+      } else {
+        let running = total;
+        const body = txns.map((txn, index) => {
+          running = Math.max(0, running - Math.max(0, toNumber(txn.amount)));
+          return [String(index + 1), fullDateLabel(txn.date), txn.note || "—", amount(txn.amount), amount(running)];
+        });
+        autoTable(doc, {
+          startY: y + 3,
+          head: [["#", "Tarih", "Açıklama", paidLabel, "Kalan"].map(pdfText)],
+          body: body.map((row) => row.map(pdfText)),
+          styles: { font: "Ayes", fontSize: 9 },
+          headStyles: { fillColor: [19, 38, 48] },
+          columnStyles: { 0: { cellWidth: 10 }, 1: { cellWidth: 32 }, 3: { halign: "right", cellWidth: 34 }, 4: { halign: "right", cellWidth: 34 } },
+        });
+        y = doc.lastAutoTable.finalY + 7;
+        if (y > 255) { doc.addPage(); y = 15; }
+        doc.setFont("Ayes", "bold"); doc.setFontSize(10);
+        doc.text(pdfText(`Toplam: ${amount(total)} · ${paidLabel}: ${amount(paid)} · Kalan: ${amount(remaining)}`), 196, y, { align: "right" });
+        y += 6;
+      }
+      if (y > 245) { doc.addPage(); y = 20; } else { y += 16; }
+      doc.setFont("Ayes", "bold"); doc.setFontSize(10);
+      doc.text(pdfText("Teslim Eden"), 14, y);
+      doc.text(pdfText("Teslim Alan"), 110, y);
+      doc.setDrawColor(180, 190, 192);
+      doc.line(14, y + 18, 84, y + 18);
+      doc.line(110, y + 18, 180, y + 18);
+      doc.setFont("Ayes", "normal"); doc.setFontSize(8); doc.setTextColor(130, 140, 142);
+      doc.text(pdfText("Ad Soyad / İmza"), 14, y + 24);
+      doc.text(pdfText("Ad Soyad / İmza"), 110, y + 24);
+      doc.setTextColor(0, 0, 0);
+      const pages = doc.getNumberOfPages();
+      for (let page = 1; page <= pages; page += 1) {
+        doc.setPage(page);
+        doc.setFont("Ayes", "normal"); doc.setFontSize(8);
+        doc.text(pdfText(`${selectedCompany?.name || "AYES GROUP"} · ${receiptTitle} · ${debt.creditor || ""} · Sayfa ${page} / ${pages}`), 14, 287);
+      }
+      const slug = String(debt.creditor || "borc").toLocaleLowerCase("tr-TR").replace(/ğ/g, "g").replace(/ü/g, "u").replace(/ş/g, "s").replace(/ı/g, "i").replace(/ö/g, "o").replace(/ç/g, "c").replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "borc";
+      doc.save(`ayes-${lent ? "tahsilat" : "odeme"}-fisi-${slug}-${today}.pdf`);
+      flash("Borç fişi indirildi.");
+    } catch (error) {
+      flash(`Fiş oluşturulamadı: ${error?.message || error}`);
+    }
+  };
   const exportData = async (format = "json") => {
     try {
     if (format === "pdf") { await exportPdf(); return; }
@@ -679,14 +776,14 @@ function App({ onSignOut }) {
         {activeView === "daily" && <DailyControl selectedDate={selectedDate} selectedRecords={selectedRecords} onNavigate={navigate} />}
         {activeView === "dailyRecords" && <DailyRecordsPage selectedRecords={selectedRecords} />}
         {activeView === "history" && <HistoricalPeriods selectedRecords={selectedRecords} />}
-        {activeView !== "overview" && activeView !== "daily" && activeView !== "dailyRecords" && activeView !== "history" && <ModuleView activeView={activeView} records={selectedRecords[activeView] || []} query={query} setQuery={setQuery} onAdd={() => setModal({ type: "entry", kind: activeView })} onEdit={(row) => setModal({ type: "entry", kind: activeView, edit: row })} onDelete={(row) => deleteRecord(activeView, row)} onDetail={activeView === "workers" ? (row) => setModal({ type: "worker-detail", worker: row }) : activeView === "debts" ? (row) => setModal({ type: "debt-detail", debtId: row.id }) : undefined} onPay={activeView === "debts" ? (row) => setModal({ type: "debt-pay", debtId: row.id }) : undefined} />}
+        {activeView !== "overview" && activeView !== "daily" && activeView !== "dailyRecords" && activeView !== "history" && <ModuleView activeView={activeView} records={selectedRecords[activeView] || []} query={query} setQuery={setQuery} onAdd={() => setModal({ type: "entry", kind: activeView })} onEdit={(row) => setModal({ type: "entry", kind: activeView, edit: row })} onDelete={(row) => deleteRecord(activeView, row)} onDetail={activeView === "workers" ? (row) => setModal({ type: "worker-detail", worker: row }) : activeView === "debts" ? (row) => setModal({ type: "debt-detail", debtId: row.id }) : undefined} onPay={activeView === "debts" ? (row) => setModal({ type: "debt-pay", debtId: row.id }) : undefined} onPrint={activeView === "debts" ? exportDebtReceipt : undefined} />}
       </div>
     </main>
     <input ref={fileInputRef} type="file" accept="application/json,.json" hidden onChange={handleImportFile}/>
     {modal?.type === "entry" && <EntryModal kind={modal.kind} edit={modal.edit} date={selectedDate} paymentMethods={paymentMethods} colors={colors} workers={selectedRecords.workers} materials={materials[selectedCompanyId] || []} onAddMaterial={addMaterial} onClose={() => setModal(null)} onSave={saveRecord}/>} 
     {modal?.type === "worker-detail" && <WorkerDetailModal worker={modal.worker} expenses={selectedRecords.expenses} onClose={() => setModal(null)}/>}
     {modal?.type === "debt-pay" && <DebtPaymentModal debt={selectedRecords.debts.find((row) => row.id === modal.debtId)} onClose={() => setModal(null)} onSave={saveDebtTransaction}/>}
-    {modal?.type === "debt-detail" && <DebtDetailModal debt={selectedRecords.debts.find((row) => row.id === modal.debtId)} onClose={() => setModal(null)} onPay={(row) => setModal({ type: "debt-pay", debtId: row.id })}/>} 
+    {modal?.type === "debt-detail" && <DebtDetailModal debt={selectedRecords.debts.find((row) => row.id === modal.debtId)} onClose={() => setModal(null)} onPay={(row) => setModal({ type: "debt-pay", debtId: row.id })} onPrint={exportDebtReceipt}/>} 
     {modal?.type === "settings" && <SettingsModal companyName={selectedCompany?.name || "AYES GROUP"} paymentMethods={paymentMethods} colors={colors} materials={materials[selectedCompanyId] || []} stockAutomationEnabled={stockAutomationEnabled} onToggleStockAutomation={setStockAutomationEnabled} onAddPayment={addPaymentMethod} onRemovePayment={removePaymentMethod} onAddColor={addColor} onRemoveColor={removeColor} onAddMaterial={addMaterial} onRemoveMaterial={removeMaterial} onExport={exportData} onImport={() => fileInputRef.current?.click()} onSignOut={onSignOut} onClose={() => setModal(null)}/>} 
     {modal?.type === "confirm-record-delete" && <ConfirmModal message={`${modal.recordName} kaydı silinsin mi?`} confirmLabel="Kaydı sil" onClose={() => setModal(null)} onConfirm={confirmDeleteRecord}/>} 
     {modal?.type === "confirm-payment-delete" && <ConfirmModal message={`${modal.method} ödeme yöntemi silinsin mi?`} confirmLabel="Ödeme yöntemini sil" onClose={() => setModal(null)} onConfirm={confirmRemovePaymentMethod}/>} 
@@ -857,7 +954,7 @@ function DailyRecordsPage({ selectedRecords }) {
   </div>;
 }
 
-function ModuleView({ activeView, records, query, setQuery, onAdd, onEdit, onDelete, onDetail, onPay }) {
+function ModuleView({ activeView, records, query, setQuery, onAdd, onEdit, onDelete, onDetail, onPay, onPrint }) {
   const copy = viewCopy[activeView];
   const isFinanceView = activeView === "sales" || activeView === "expenses";
   const [filterOpen, setFilterOpen] = useState(false);
@@ -936,7 +1033,7 @@ function ModuleView({ activeView, records, query, setQuery, onAdd, onEdit, onDel
       </div>}
       <div className="module-result-meta"><span>{visibleRows.length} kayıt gösteriliyor</span>{(query || activeFilterCount) && <span>Toplam {records.length} kayıttan süzüldü</span>}</div>
       {activeView === "debts" && <div className="debt-tabs" role="tablist" aria-label="Borç türü filtresi"><button type="button" role="tab" aria-selected={debtFilter === "all"} className={`debt-tab ${debtFilter === "all" ? "active" : ""}`} onClick={() => setDebtFilter("all")}>Tümü <span className="count">({records.length})</span></button><button type="button" role="tab" aria-selected={debtFilter === "owed"} className={`debt-tab ${debtFilter === "owed" ? "active" : ""}`} onClick={() => setDebtFilter("owed")}>Alınan borç <span className="count">({owedCount})</span></button><button type="button" role="tab" aria-selected={debtFilter === "lent"} className={`debt-tab ${debtFilter === "lent" ? "active" : ""}`} onClick={() => setDebtFilter("lent")}>Verilen borç <span className="count">({lentCount})</span></button></div>}
-      <ModuleTable kind={activeView} rows={sortedRows} onEdit={onEdit} onDelete={onDelete} onDetail={onDetail} onPay={onPay}/>
+      <ModuleTable kind={activeView} rows={sortedRows} onEdit={onEdit} onDelete={onDelete} onDetail={onDetail} onPay={onPay} onPrint={onPrint}/>
     </section>
   </div>;
 }
@@ -957,7 +1054,7 @@ function DebtProgress({ row }) {
   return <div className="progress-cell"><div className="progress-bar" role="progressbar" aria-valuenow={percent} aria-valuemin="0" aria-valuemax="100" aria-label={`%${percent} tamamlandı`}><span style={{ width: `${percent}%` }}/></div><small>%{percent}</small></div>;
 }
 
-function DebtTable({ rows, onEdit, onDelete, onDetail, onPay }) {
+function DebtTable({ rows, onEdit, onDelete, onDetail, onPay, onPrint }) {
   if (!rows.length) return <div className="empty-module-state"><span className="empty-icon"><Icon name="receipt" size={19}/></span><strong>Borçlar için henüz kayıt yok</strong><span>İlk kaydı eklediğinizde bu bölümde görünecek.</span></div>;
   return <div className="table-wrap module-table"><table><thead><tr><th>KİŞİ</th><th>TÜR</th><th>VADE</th><th className="align-right">TOPLAM</th><th className="align-right">ÖDENEN / TAHSİL</th><th className="align-right">KALAN</th><th>DURUM</th><th></th></tr></thead><tbody>{rows.map((row) => {
     const debt = normalizeDebtRow(row);
@@ -965,15 +1062,15 @@ function DebtTable({ rows, onEdit, onDelete, onDetail, onPay }) {
     const amounts = debtAmounts(debt);
     const status = debtStatusLabel(debt);
     const tone = amounts.remaining <= 0 && amounts.total > 0 ? "success" : amounts.paid > 0 ? "warning" : "danger";
-    return <tr key={debt.id}><td><div className="person-cell"><span className="row-avatar debt-avatar"><Icon name="receipt" size={15}/></span><span className="debt-person"><strong>{debt.creditor}</strong><small>{debt.source}</small></span></div></td><td><Badge tone={lent ? "teal" : "warning"}>{lent ? "Verilen" : "Alınan"}</Badge></td><td>{debt.due}</td><td className="align-right amount">{amount(amounts.total)}</td><td className="align-right">{amount(amounts.paid)}</td><td className="align-right amount">{amount(amounts.remaining)}</td><td><div className="payment-cell"><Badge tone={tone}>{status}</Badge><DebtProgress row={debt}/></div></td><td className="record-actions">{amounts.remaining > 0 && onPay && <button className="button primary small" onClick={() => onPay(debt)}>{lent ? "Tahsilat" : "Öde"}</button>}{onDetail && <button className="row-action" onClick={() => onDetail(debt)} aria-label="İşlem detayı" title="İşlem detayı"><Icon name="receipt" size={15}/></button>}<button className="row-action" onClick={() => onEdit(debt)} aria-label="Düzenle"><Icon name="edit" size={15}/></button><button className="row-action danger-action" onClick={() => onDelete(debt)} aria-label="Sil"><Icon name="trash" size={15}/></button></td></tr>;
+    return <tr key={debt.id}><td><div className="person-cell"><span className="row-avatar debt-avatar"><Icon name="receipt" size={15}/></span><span className="debt-person"><strong>{debt.creditor}</strong><small>{debt.source}</small></span></div></td><td><Badge tone={lent ? "teal" : "warning"}>{lent ? "Verilen" : "Alınan"}</Badge></td><td>{debt.due}</td><td className="align-right amount">{amount(amounts.total)}</td><td className="align-right">{amount(amounts.paid)}</td><td className="align-right amount">{amount(amounts.remaining)}</td><td><div className="payment-cell"><Badge tone={tone}>{status}</Badge><DebtProgress row={debt}/></div></td><td className="record-actions">{amounts.remaining > 0 && onPay && <button className="button primary small" onClick={() => onPay(debt)}>{lent ? "Tahsilat" : "Öde"}</button>}{onDetail && <button className="row-action" onClick={() => onDetail(debt)} aria-label="İşlem detayı" title="İşlem detayı"><Icon name="receipt" size={15}/></button>}{onPrint && <button className="row-action" onClick={() => onPrint(debt)} aria-label="Fiş yazdır" title="Fiş yazdır (PDF)"><Icon name="download" size={15}/></button>}<button className="row-action" onClick={() => onEdit(debt)} aria-label="Düzenle"><Icon name="edit" size={15}/></button><button className="row-action danger-action" onClick={() => onDelete(debt)} aria-label="Sil"><Icon name="trash" size={15}/></button></td></tr>;
   })}</tbody></table></div>;
 }
 
-function ModuleTable({ kind, rows, onEdit, onDelete, onDetail, onPay }) {
+function ModuleTable({ kind, rows, onEdit, onDelete, onDetail, onPay, onPrint }) {
   if (kind === "sales") return <div className="table-wrap module-table"><table><thead><tr><th>TARİH</th><th>MÜŞTERİ</th><th>MALZEME</th><th>ADET</th><th>ÖDEME</th><th className="align-right">TUTAR</th><th>FATURA</th><th></th></tr></thead><tbody>{rows.map((row) => <tr key={row.id}><td>{dateLabel(row.date)}</td><td><div className="person-cell"><span className="row-avatar">{row.customer.slice(0, 1)}</span><strong>{row.customer}</strong></div></td><td>{row.product}</td><td>{money(row.qty)}</td><td><PaymentCell row={row}/></td><td className="align-right amount">{amount(row.total)}</td><td>{row.invoice}</td><RecordActions row={row} onEdit={onEdit} onDelete={onDelete}/></tr>)}</tbody></table></div>;
   if (kind === "expenses") return <div className="table-wrap module-table"><table><thead><tr><th>TARİH</th><th>KATEGORİ</th><th>AÇIKLAMA</th><th>ÖDEME</th><th className="align-right">TUTAR</th><th>DURUM</th><th></th></tr></thead><tbody>{rows.map((row) => <tr key={row.id}><td>{dateLabel(row.date)}</td><td><div className="category-cell"><span className="category-icon"><Icon name={row.category === "Transport" ? "truck" : row.category === "Yakıt" ? "factory" : "receipt"} size={15}/></span>{row.category}</div></td><td><div>{row.detail}</div>{row.worker ? <small className="cell-sub">Çalışan: {row.worker}</small> : null}{row.note ? <small className="cell-sub">{row.note}</small> : null}</td><td><PaymentCell row={row}/></td><td className="align-right amount">{amount(row.amount)}</td><td><Badge tone={row.status === "İnceleniyor" ? "warning" : "success"}>{row.status}</Badge></td><RecordActions row={row} onEdit={onEdit} onDelete={onDelete}/></tr>)}</tbody></table></div>;
   if (kind === "matExpenses") return <div className="table-wrap module-table"><table><thead><tr><th>TARİH</th><th>ÜRÜN CİNSİ</th><th>RENK</th><th>PAKET</th><th>BOY</th><th>BİRİM FİYAT</th><th className="align-right">TOPLAM TUTAR</th><th></th></tr></thead><tbody>{rows.map((row) => <tr key={row.id}><td>{dateLabel(row.date)}</td><td><strong>{row.product}</strong></td><td>{row.color || <span className="muted-text">—</span>}</td><td>{row.package || <span className="muted-text">—</span>}</td><td>{row.length || <span className="muted-text">—</span>}</td><td>{row.unitPrice != null && row.unitPrice !== "" ? amount(row.unitPrice) : <span className="muted-text">—</span>}</td><td className="align-right amount">{amount(row.total)}</td><RecordActions row={row} onEdit={onEdit} onDelete={onDelete}/></tr>)}</tbody></table></div>;
-  if (kind === "debts") return <DebtTable rows={rows} onEdit={onEdit} onDelete={onDelete} onDetail={onDetail} onPay={onPay}/>;
+  if (kind === "debts") return <DebtTable rows={rows} onEdit={onEdit} onDelete={onDelete} onDetail={onDetail} onPay={onPay} onPrint={onPrint}/>;
   return <LegacyModuleTable kind={kind} rows={rows} onEdit={onEdit} onDelete={onDelete} onDetail={onDetail}/>;
 }
 
@@ -1071,7 +1168,7 @@ function DebtPaymentModal({ debt, onClose, onSave }) {
   </Modal>;
 }
 
-function DebtDetailModal({ debt, onClose, onPay }) {
+function DebtDetailModal({ debt, onClose, onPay, onPrint }) {
   const row = debt ? normalizeDebtRow(debt) : null;
   if (!row) return null;
   const lent = debtDirection(row) === "lent";
@@ -1083,7 +1180,7 @@ function DebtDetailModal({ debt, onClose, onPay }) {
       <div className="pay-summary"><div><span>Toplam</span><strong>{amount(total)}</strong></div><div><span>{lent ? "Tahsil edilen" : "Ödenen"}</span><strong>{amount(paid)}</strong></div><div><span>Kalan</span><strong className={remaining > 0 ? "negative" : "positive"}>{amount(remaining)}</strong></div><div><span>Vade</span><strong>{row.due || "Açık"}</strong></div></div>
       <DebtProgress row={row}/>
       {txns.length ? <div className="txn-list">{txns.map((txn) => <div className="txn-row" key={txn.id}><span className="txn-date">{fullDateLabel(txn.date)}</span><span className="txn-note">{txn.note || <span className="muted-text">Açıklama yok</span>}</span><strong className="txn-amount">{amount(txn.amount)}</strong></div>)}</div> : <div className="empty-table-state"><span className="empty-icon"><Icon name="receipt" size={19}/></span><strong>Henüz işlem yok</strong><span>Listesindeki {lent ? "Tahsilat" : "Öde"} tuşuyla ilk işlemi ekleyin.</span></div>}
-      <div className="modal-actions">{remaining > 0 && <button type="button" className="button primary" onClick={() => onPay(row)}><Icon name="check" size={16}/> {lent ? "Tahsilat yap" : "Ödeme yap"}</button>}<button type="button" className="button secondary" onClick={onClose}>Kapat</button></div>
+      <div className="modal-actions">{onPrint && <button type="button" className="button secondary" onClick={() => onPrint(row)}><Icon name="download" size={16}/> Fiş yazdır</button>}<button type="button" className="button secondary" onClick={onClose}>Kapat</button>{remaining > 0 && <button type="button" className="button primary" onClick={() => onPay(row)}><Icon name="check" size={16}/> {lent ? "Tahsilat yap" : "Ödeme yap"}</button>}</div>
     </div>
   </Modal>;
 }
