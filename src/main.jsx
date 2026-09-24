@@ -157,6 +157,7 @@ const emptyMaterials = { default: [] };
 const emptyStockAutomation = {};
 const persistedStateKeys = ["companies", "records", "paymentMethods", "colors", "materials", "stockAutomation"];
 const samePersistedValue = (left, right) => JSON.stringify(left) === JSON.stringify(right);
+const moduleKeysOf = (...recordSets) => [...new Set(recordSets.flatMap((set) => Object.keys(set || {})))];
 const normalizeMaterialName = (value) => String(value || "").trim().replace(/\s+/g, " ").toLocaleLowerCase("tr-TR");
 const stockStateFor = (stock, currentState) => toNumber(stock) <= 0 ? "Düşük" : currentState === "Düşük" ? "İyi" : currentState || "Takipte";
 const shiftIsoDate = (iso, days) => {
@@ -282,6 +283,7 @@ function App({ onSignOut }) {
   const [query, setQuery] = useState("");
   const [dataReady, setDataReady] = useState(!supabaseConfigured);
   const [syncState, setSyncState] = useState(supabaseConfigured ? "Veritabanı bağlanıyor..." : "Yerel mod");
+  const [syncBlocked, setSyncBlocked] = useState(false);
   const fileInputRef = useRef(null);
   const lastSyncedPayloadRef = useRef(null);
   const selectedCompany = companies[0] || seedCompanies[0];
@@ -337,7 +339,7 @@ function App({ onSignOut }) {
     return () => { mounted = false; };
   }, []);
   useEffect(() => {
-    if (!supabase || !dataReady || !lastSyncedPayloadRef.current) return undefined;
+    if (!supabase || !dataReady || !lastSyncedPayloadRef.current || syncBlocked) return undefined;
     const baseline = lastSyncedPayloadRef.current;
     const changedKeys = persistedStateKeys.filter((key) => !samePersistedValue(remotePayload[key], baseline[key]));
     if (!changedKeys.length) return undefined;
@@ -351,6 +353,32 @@ function App({ onSignOut }) {
         return;
       }
       const latestPayload = latestRow?.payload || {};
+      const baselineRecords = baseline.records || {};
+      const pendingRecords = pendingPayload.records || {};
+      const latestRecords = latestPayload.records || {};
+      const modules = moduleKeysOf(baselineRecords, pendingRecords, latestRecords);
+      const conflicts = [];
+      if (changedKeys.includes("records")) {
+        modules.forEach((module) => {
+          const localChanged = !samePersistedValue(pendingRecords[module] || [], baselineRecords[module] || []);
+          const serverChanged = !samePersistedValue(latestRecords[module] || [], baselineRecords[module] || []);
+          const diverged = !samePersistedValue(pendingRecords[module] || [], latestRecords[module] || []);
+          if (localChanged && serverChanged && diverged) conflicts.push(module);
+        });
+      }
+      changedKeys.filter((key) => key !== "records").forEach((key) => {
+        const localChanged = !samePersistedValue(pendingPayload[key], baseline[key]);
+        const serverChanged = !samePersistedValue(latestPayload[key], baseline[key]);
+        const diverged = !samePersistedValue(pendingPayload[key], latestPayload[key]);
+        if (localChanged && serverChanged && diverged) conflicts.push(key);
+      });
+      if (conflicts.length) {
+        saveStored("accounting-conflict-backup-v1", { savedAt: new Date().toISOString(), payload: pendingPayload });
+        setSyncBlocked(true);
+        setSyncState("Senkron çakışması — sayfayı yenileyin");
+        flash("Başka bir oturumda değişiklik yapılmış. Üzerine yazmadım; çalışmanız yedeğe alındı, sayfayı yenileyin.");
+        return;
+      }
       const mergedPayload = {
         version: 3,
         companies: [{ ...seedCompanies[0] }],
@@ -361,7 +389,14 @@ function App({ onSignOut }) {
         reconciliation: latestPayload.reconciliation || {},
         stockAutomation: latestPayload.stockAutomation || emptyStockAutomation,
       };
-      changedKeys.forEach((key) => { mergedPayload[key] = pendingPayload[key]; });
+      changedKeys.forEach((key) => {
+        if (key !== "records") { mergedPayload[key] = pendingPayload[key]; return; }
+        const mergedRecords = { ...(mergedPayload.records || {}) };
+        modules.forEach((module) => {
+          if (!samePersistedValue(pendingRecords[module] || [], baselineRecords[module] || [])) mergedRecords[module] = pendingRecords[module] || [];
+        });
+        mergedPayload.records = mergedRecords;
+      });
       const { error } = await supabase.from("accounting_state").upsert({ id: "main", payload: mergedPayload, updated_at: new Date().toISOString() }, { onConflict: "id" });
       if (error) {
         setSyncState("Yerel yedek kullanılıyor");
@@ -374,7 +409,7 @@ function App({ onSignOut }) {
       }
     }, 350);
     return () => window.clearTimeout(timer);
-  }, [dataReady, remotePayload]);
+  }, [dataReady, remotePayload, syncBlocked]);
 
   if (!dataReady) return <div className="app-loading"><div className="brand-mark"><span></span><span></span><span></span></div><strong>Veritabanı bağlantısı kuruluyor</strong><span>Muhasebe verileri hazırlanıyor...</span></div>;
 
