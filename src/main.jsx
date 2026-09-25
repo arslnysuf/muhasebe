@@ -47,6 +47,7 @@ const toNumber = (value) => {
 const money = (value) => new Intl.NumberFormat("tr-TR", { maximumFractionDigits: 20, minimumFractionDigits: 0 }).format(toNumber(value));
 const amount = (value) => `₺${money(value)}`;
 const pdfText = (value) => String(value ?? "");
+const slugifyTr = (value, fallback) => String(value || fallback).toLocaleLowerCase("tr-TR").replace(/ğ/g, "g").replace(/ü/g, "u").replace(/ş/g, "s").replace(/ı/g, "i").replace(/ö/g, "o").replace(/ç/g, "c").replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || fallback;
 let ayesFontFiles = null;
 const getAyesFontFiles = async () => {
   if (!ayesFontFiles) {
@@ -139,7 +140,94 @@ const normalizeDebtRow = (row = {}) => {
   if (legacyPaid <= 0) return { ...row, direction, transactions: [] };
   return { ...row, direction, transactions: [{ id: `${row.id || "debt"}-legacy`, date: row.date || today, amount: legacyPaid, note: direction === "lent" ? "Aktarılan tahsilat" : "Aktarılan ödeme" }] };
 };
-const normalizeStoredRecords = (stored = {}) => ({ ...emptyRecords, ...stored, debts: ((stored && stored.debts) || []).map(normalizeDebtRow) });
+const normalizeCustomerName = (value) => String(value || "").trim().replace(/\s+/g, " ").toLocaleLowerCase("tr-TR");
+const normalizeCreditSale = (row = {}) => {
+  const transactions = (Array.isArray(row.transactions) ? row.transactions : []).filter((txn) => txn && toNumber(txn.amount) > 0).map((txn) => ({ id: txn.id || `txn-${Date.now()}`, date: txn.date || row.date || today, amount: toNumber(txn.amount), note: txn.note || "", payment: txn.payment || "" }));
+  return { ...row, customer: row.customer || "Yeni müşteri", product: row.product || "Vadeli satış", qty: row.qty ?? null, total: Math.max(0, toNumber(row.total)), downPayment: Math.max(0, toNumber(row.downPayment)), payment: row.payment || "", invoice: row.invoice || "", due: row.due || "Açık", transactions };
+};
+const creditAmounts = (row = {}) => {
+  const total = Math.max(0, toNumber(row.total));
+  const down = Math.max(0, toNumber(row.downPayment));
+  const collected = (Array.isArray(row.transactions) ? row.transactions : []).reduce((sum, txn) => sum + Math.max(0, toNumber(txn && txn.amount)), 0);
+  const paid = down + collected;
+  return { total, down, collected, paid, remaining: Math.max(0, total - paid) };
+};
+const creditStatusLabel = (row = {}) => {
+  const { total, paid, remaining } = creditAmounts(row);
+  if (total > 0 && remaining <= 0) return "Tahsil edildi";
+  if (paid > 0) return "Kısmi tahsilat";
+  return "Tahsil edilmedi";
+};
+const creditProductLabel = (row = {}) => {
+  const base = row.product || "Vadeli satış";
+  const qty = toNumber(row.qty);
+  return `${base}${qty > 0 ? ` · ${money(qty)} adet` : ""}${row.invoice ? ` · ${row.invoice}` : ""}`;
+};
+const creditToDebtLike = (row = {}) => {
+  const sale = normalizeCreditSale(row);
+  const down = Math.max(0, toNumber(sale.downPayment));
+  return { ...sale, direction: "lent", creditor: sale.customer, source: creditProductLabel(sale), amount: sale.total, transactions: [...(down > 0 ? [{ id: `${sale.id || "credit"}-downpayment`, date: sale.date || today, amount: down, note: "Peşinat" }] : []), ...sale.transactions] };
+};
+const groupCreditSalesByCustomer = (rows = []) => {
+  const map = new Map();
+  (rows || []).forEach((row) => {
+    const sale = normalizeCreditSale(row);
+    const key = normalizeCustomerName(sale.customer) || "isimsiz";
+    if (!map.has(key)) map.set(key, { key, name: String(sale.customer || "").trim().replace(/\s+/g, " ") || "İsimsiz", sales: [], total: 0, paid: 0, remaining: 0, openCount: 0 });
+    const group = map.get(key);
+    const amounts = creditAmounts(sale);
+    group.sales.push(sale);
+    group.total += amounts.total; group.paid += amounts.paid; group.remaining += amounts.remaining;
+    if (amounts.remaining > 0) group.openCount += 1;
+  });
+  return [...map.values()].map((group) => ({ ...group, sales: group.sales.sort((left, right) => String(left.date).localeCompare(String(right.date))) })).sort((left, right) => right.remaining - left.remaining || left.name.localeCompare(right.name, "tr-TR"));
+};
+const splitPaymentAmounts = (row, amount) => {
+  if (hasValue(row.cashAmount) || hasValue(row.mpesaAmount)) return { cash: toNumber(row.cashAmount), mpesa: toNumber(row.mpesaAmount) };
+  if (/m-pesa/i.test(String(row.payment || ""))) return { cash: 0, mpesa: amount };
+  if (/nakit/i.test(String(row.payment || ""))) return { cash: amount, mpesa: 0 };
+  return { cash: 0, mpesa: 0 };
+};
+const buildIncomeEvents = (recordsLike = {}) => {
+  const events = [];
+  let cashCount = 0, collectionCount = 0;
+  (recordsLike.sales || []).forEach((row) => {
+    const total = toNumber(row.total);
+    if (!(total > 0) || !/^\d{4}-\d{2}-\d{2}$/.test(String(row.date || ""))) return;
+    const split = splitPaymentAmounts(row, total);
+    events.push({ date: row.date, amount: total, cash: split.cash, mpesa: split.mpesa, kind: "cash" });
+    cashCount += 1;
+  });
+  (recordsLike.creditSales || []).forEach((row) => {
+    const sale = normalizeCreditSale(row);
+    const down = Math.max(0, toNumber(sale.downPayment));
+    if (down > 0 && /^\d{4}-\d{2}-\d{2}$/.test(String(sale.date || ""))) {
+      const split = splitPaymentAmounts({ payment: sale.payment }, down);
+      events.push({ date: sale.date, amount: down, cash: split.cash, mpesa: split.mpesa, kind: "down" });
+      collectionCount += 1;
+    }
+    sale.transactions.forEach((txn) => {
+      const txnAmount = toNumber(txn.amount);
+      if (!(txnAmount > 0) || !/^\d{4}-\d{2}-\d{2}$/.test(String(txn.date || ""))) return;
+      const split = splitPaymentAmounts(txn, txnAmount);
+      events.push({ date: txn.date, amount: txnAmount, cash: split.cash, mpesa: split.mpesa, kind: "collection" });
+      collectionCount += 1;
+    });
+  });
+  events.sort((left, right) => String(left.date).localeCompare(String(right.date)));
+  return { events, total: events.reduce((sum, event) => sum + event.amount, 0), cashCount, collectionCount };
+};
+const lentToCreditSale = (row = {}) => {
+  const debt = normalizeDebtRow(row);
+  return normalizeCreditSale({ id: debt.id, companyId: debt.companyId, date: debt.date, customer: debt.creditor, product: debt.source || "Aktarılan vadeli satış", qty: null, total: toNumber(debt.amount), downPayment: 0, payment: "", invoice: "", due: debt.due, transactions: debt.transactions, migrated: true, stockDeducted: false, stockMaterialId: null, stockMaterialName: null, stockQty: null, stockRowId: null });
+};
+const normalizeStoredRecords = (stored = {}) => {
+  const debts = ((stored && stored.debts) || []).map(normalizeDebtRow);
+  const migrated = debts.filter((row) => debtDirection(row) === "lent").map(lentToCreditSale);
+  const existingCredit = ((stored && stored.creditSales) || []).map(normalizeCreditSale);
+  const existingIds = new Set(existingCredit.map((row) => row.id));
+  return { ...emptyRecords, ...stored, debts: debts.filter((row) => debtDirection(row) !== "lent"), creditSales: [...existingCredit, ...migrated.filter((row) => !existingIds.has(row.id))] };
+};
 const isSplitPayment = (payment) => {
   const text = String(payment || "");
   return /nakit/i.test(text) && (/m-pesa/i.test(text) || /havale/i.test(text) || /eft/i.test(text));
@@ -150,7 +238,7 @@ const seedCompanies = [
   { id: "default", name: "AYES GROUP", location: "", status: "Taslak", completion: 0, color: "teal" },
 ];
 
-const emptyRecords = { sales: [], expenses: [], production: [], stock: [], workers: [], debts: [], matExpenses: [] };
+const emptyRecords = { sales: [], expenses: [], production: [], stock: [], workers: [], debts: [], matExpenses: [], creditSales: [] };
 const defaultPaymentMethods = ["Nakit", "Nakit + Havale / EFT", "Havale / EFT", "Kredi Kartı", "Banka"];
 const defaultColors = ["Beyaz", "A. Meşe", "A. Gri"];
 const emptyMaterials = { default: [] };
@@ -202,17 +290,18 @@ const saveStored = (key, value) => {
 
 const navGroups = [
   { label: "ANA MENÜ", items: [{ id: "overview", label: "Genel bakış", icon: "grid" }, { id: "daily", label: "Günlük kontrol", icon: "calendar" }, { id: "dailyRecords", label: "Günlük kayıtlar", icon: "calendar" }, { id: "history", label: "Geçmiş dönemler", icon: "receipt" }] },
-  { label: "İŞLETME MODÜLLERİ", items: [{ id: "sales", label: "Gelir / satış", icon: "arrowUp" }, { id: "expenses", label: "Giderler", icon: "arrowDown" }, { id: "matExpenses", label: "Malzeme giderleri", icon: "wallet" }, { id: "production", label: "Üretim", icon: "factory" }, { id: "stock", label: "Malzeme stoku", icon: "box" }, { id: "workers", label: "İşçiler", icon: "users" }, { id: "debts", label: "Borçlar", icon: "receipt" }] },
+  { label: "İŞLETME MODÜLLERİ", items: [{ id: "sales", label: "Peşin satış", icon: "arrowUp" }, { id: "creditSales", label: "Vadeli satış", icon: "briefcase" }, { id: "expenses", label: "Giderler", icon: "arrowDown" }, { id: "matExpenses", label: "Malzeme giderleri", icon: "wallet" }, { id: "production", label: "Üretim", icon: "factory" }, { id: "stock", label: "Malzeme stoku", icon: "box" }, { id: "workers", label: "İşçiler", icon: "users" }, { id: "debts", label: "Alınan borçlar", icon: "receipt" }] },
 ];
 
 const viewCopy = {
-  sales: { title: "Gelir ve satışlar", kicker: "SATIŞ KAYITLARI", description: "Fatura, müşteri ve ödeme hareketlerini işletme bazında yönetin.", icon: "arrowUp", primary: "Satış ekle", kind: "sales" },
+  sales: { title: "Peşin satışlar", kicker: "SATIŞ KAYITLARI", description: "Peşin tahsil edilen satışları fatura, müşteri ve ödeme hareketleriyle yönetin.", icon: "arrowUp", primary: "Satış ekle", kind: "sales" },
+  creditSales: { title: "Vadeli satışlar", kicker: "VADELİ SATIŞ TAKİBİ", description: "Veresiye satışları müşteri bazında tahsilat hareketleriyle birlikte takip edin.", icon: "briefcase", primary: "Vadeli satış ekle", kind: "creditSales" },
   expenses: { title: "Gider kayıtları", kicker: "GİDER KONTROLÜ", description: "Günlük işletme harcamalarını kategori ve ödeme kanalına göre izleyin.", icon: "arrowDown", primary: "Gider ekle", kind: "expenses" },
   matExpenses: { title: "Malzeme giderleri", kicker: "MALZEME ALIMLARI", description: "Ürün cinsi, renk, paket, boy ve tutar bilgileriyle malzeme girişlerini yönetin.", icon: "wallet", primary: "Malzeme gideri ekle", kind: "matExpenses" },
   production: { title: "Üretim takibi", kicker: "GÜN SONU ÜRETİMİ", description: "Palet, adet, fire ve hammadde kullanımını günlük olarak takip edin.", icon: "factory", primary: "Üretim kaydı", kind: "production" },
   stock: { title: "Malzeme stoku", kicker: "STOK DURUMU", description: "Ürün ve hammadde bakiyelerini hareketleriyle birlikte yönetin.", icon: "box", primary: "Stok hareketi", kind: "stock" },
   workers: { title: "İşçi ve maaşlar", kicker: "PERSONEL KONTROLÜ", description: "Maaş, avans, devamsızlık ve bakiye durumunu çalışan bazında izleyin.", icon: "users", primary: "Çalışan ekle", kind: "workers" },
-  debts: { title: "Borçlar", kicker: "ALINAN VE VERİLEN BORÇLAR", description: "Alınan ve verilen borçları ödeme ve tahsilat hareketleriyle birlikte takip edin.", icon: "receipt", primary: "Borç ekle", kind: "debts" },
+  debts: { title: "Alınan borçlar", kicker: "ALINAN BORÇLAR", description: "Şirketin borçlarını ödeme hareketleriyle birlikte takip edin.", icon: "receipt", primary: "Borç ekle", kind: "debts" },
   history: { title: "Geçmiş dönemler", kicker: "AY SONU RAPORLARI", description: "Sadece tamamlanmış ayların gelir, gider ve operasyon sonuçlarını karşılaştırın.", icon: "receipt", primary: "", kind: "history" },
   dailyRecords: { title: "Günlük kayıtlar", kicker: "AYLIK GÜN RAPORLARI", description: "Seçili ayın her gününü ve o güne ait otomatik kayıt özetini görüntüleyin.", icon: "calendar", primary: "", kind: "dailyRecords" },
 };
@@ -287,12 +376,16 @@ function App({ onSignOut }) {
   const fileInputRef = useRef(null);
   const lastSyncedPayloadRef = useRef(null);
   const selectedCompany = companies[0] || seedCompanies[0];
-  const selectedRecords = useMemo(() => Object.fromEntries(Object.entries(records).map(([key, rows]) => [key, key === "debts" ? rows.filter((row) => row.companyId === selectedCompanyId).map(normalizeDebtRow) : rows.filter((row) => row.companyId === selectedCompanyId)])), [records, selectedCompanyId]);
+  const selectedRecords = useMemo(() => Object.fromEntries(Object.entries(records).map(([key, rows]) => [key, key === "debts" ? rows.filter((row) => row.companyId === selectedCompanyId).map(normalizeDebtRow) : key === "creditSales" ? rows.filter((row) => row.companyId === selectedCompanyId).map(normalizeCreditSale) : rows.filter((row) => row.companyId === selectedCompanyId)])), [records, selectedCompanyId]);
   const stockAutomationEnabled = Boolean(stockAutomation[selectedCompanyId]);
   const remotePayload = useMemo(() => ({ version: 3, companies, records, paymentMethods, colors, materials, stockAutomation }), [companies, records, paymentMethods, colors, materials, stockAutomation]);
-  const salesTotal = selectedRecords.sales.reduce((sum, row) => sum + toNumber(row.total), 0);
+  const incomeData = useMemo(() => buildIncomeEvents(selectedRecords), [selectedRecords]);
+  const incomeTotal = incomeData.total;
   const expenseTotal = selectedRecords.expenses.reduce((sum, row) => sum + toNumber(row.amount), 0);
   const debtTotal = selectedRecords.debts.reduce((sum, row) => sum + (debtDirection(row) === "lent" ? 0 : debtAmounts(row).remaining), 0);
+  const creditOpenTotal = selectedRecords.creditSales.reduce((sum, row) => sum + creditAmounts(row).remaining, 0);
+  const openCreditCount = selectedRecords.creditSales.filter((row) => creditAmounts(row).remaining > 0).length;
+  const creditCustomerNames = useMemo(() => [...new Set(selectedRecords.creditSales.map((row) => String(row.customer || "").trim()).filter(Boolean))].sort((left, right) => left.localeCompare(right, "tr-TR")), [selectedRecords.creditSales]);
 
   useEffect(() => { saveStored("accounting-companies-v2", companies); }, [companies]);
   useEffect(() => { saveStored("accounting-records-v2", records); }, [records]);
@@ -477,14 +570,16 @@ function App({ onSignOut }) {
     document.body.appendChild(link); link.click();
     window.setTimeout(() => { link.remove(); URL.revokeObjectURL(url); }, 1000);
   };
-  const reportModuleKeys = ["sales", "expenses", "matExpenses", "production", "stock", "workers", "debts"];
+  const reportModuleKeys = ["sales", "creditSales", "expenses", "matExpenses", "production", "stock", "workers", "debts"];
   const isModuleReport = reportModuleKeys.includes(activeView);
   const reportTitle = isModuleReport ? viewCopy[activeView].title : "Muhasebe raporu";
   const reportSlug = isModuleReport ? activeView : "genel";
   const buildReportSections = () => {
     const all = [
-      { key: "sales", title: "Gelir / Satış", widths: [14, 26, 26, 12, 18, 16, 14], rows: selectedRecords.sales,
+      { key: "sales", title: "Peşin Satış", widths: [14, 26, 26, 12, 18, 16, 14], rows: selectedRecords.sales,
         columns: [{ h: "Tarih", v: (r) => r.date }, { h: "Müşteri", v: (r) => r.customer }, { h: "Malzeme", v: (r) => r.product }, { h: "Adet", v: (r) => toNumber(r.qty), num: true }, { h: "Tutar", v: (r) => toNumber(r.total), money: true }, { h: "Ödeme", v: (r) => r.payment }, { h: "Fatura", v: (r) => r.invoice }] },
+      { key: "creditSales", title: "Vadeli Satış", widths: [14, 26, 26, 18, 18, 18, 14], rows: selectedRecords.creditSales,
+        columns: [{ h: "Tarih", v: (r) => r.date }, { h: "Müşteri", v: (r) => r.customer }, { h: "Ürün", v: (r) => r.product }, { h: "Toplam", v: (r) => creditAmounts(r).total, money: true }, { h: "Tahsil", v: (r) => creditAmounts(r).paid, money: true }, { h: "Kalan", v: (r) => creditAmounts(r).remaining, money: true }, { h: "Vade", v: (r) => r.due }] },
       { key: "expenses", title: "Giderler", widths: [14, 24, 46, 18, 16], rows: selectedRecords.expenses,
         columns: [{ h: "Tarih", v: (r) => r.date }, { h: "Kategori", v: (r) => r.category }, { h: "Açıklama", v: (r) => `${r.detail || ""}${r.worker ? ` (${r.worker})` : ""}${r.note ? ` - ${r.note}` : ""}` }, { h: "Tutar", v: (r) => toNumber(r.amount), money: true }, { h: "Ödeme", v: (r) => r.payment }] },
       { key: "matExpenses", title: "Malzeme giderleri", widths: [14, 30, 16, 16, 14, 18], rows: selectedRecords.matExpenses,
@@ -517,7 +612,7 @@ function App({ onSignOut }) {
     doc.text(pdfText(selectedCompany?.name || "AYES GROUP"), 44, 20);
     doc.setFont(pdfFont, "normal"); doc.setFontSize(10);
     doc.text(pdfText(`${reportTitle} · ${today}`), 44, 27);
-    doc.text(pdfText(isModuleReport ? `Kayıt sayısı: ${sections[0]?.rows.length || 0}` : `Toplam gelir: ${amount(salesTotal)} · Toplam gider: ${amount(expenseTotal)} · Açık borç: ${amount(debtTotal)}`), 44, 33);
+    doc.text(pdfText(isModuleReport ? `Kayıt sayısı: ${sections[0]?.rows.length || 0}` : `Toplam gelir: ${amount(incomeTotal)} · Toplam gider: ${amount(expenseTotal)} · Açık borç: ${amount(debtTotal)} · Bekleyen tahsilat: ${amount(creditOpenTotal)}`), 44, 33);
     let y = 41;
     const section = (title, head, body) => {
       if (!body.length) return;
@@ -537,11 +632,18 @@ function App({ onSignOut }) {
     doc.save(`ayes-muhasebe-${reportSlug}-${today}.pdf`);
     flash("PDF rapor indirildi.");
   };
-  const exportDebtReceipt = async (debtRow) => {
+  const exportDebtReceipt = async (debtRow, labels = {}) => {
     try {
       const debt = normalizeDebtRow(debtRow || {});
-      if (!debt.id) { flash("Borç kaydı bulunamadı."); return; }
+      if (!debt.id) { flash(labels.notFound || "Borç kaydı bulunamadı."); return; }
       const lent = debtDirection(debt) === "lent";
+      const personLabel = lent ? (labels.lentPerson || "Borçlu") : "Alacaklı";
+      const kindLine = lent ? (labels.lentKind || "Verilen borç") : "Alınan borç";
+      const infoTitle = labels.infoTitle || "Borç Bilgileri";
+      const typeLabel = labels.typeLabel || "Borç Türü";
+      const typeValue = lent ? (labels.lentType || "Verilen borç (tahsil edilecek)") : "Alınan borç (ödenecek)";
+      const sourceLabel = labels.sourceLabel || "Kaynak / Açıklama";
+      const dateRowLabel = labels.dateRowLabel || "Borç Tarihi";
       const { total, paid, remaining } = debtAmounts(debt);
       const receiptTitle = lent ? "Tahsilat Fişi" : "Ödeme Fişi";
       const movementTitle = lent ? "Tahsilat Hareketleri" : "Ödeme Hareketleri";
@@ -556,17 +658,17 @@ function App({ onSignOut }) {
       doc.text(pdfText(selectedCompany?.name || "AYES GROUP"), 44, 20);
       doc.setFont(pdfFont, "normal"); doc.setFontSize(10);
       doc.text(pdfText(`${receiptTitle} · ${fullDateLabel(today)}`), 44, 27);
-      doc.text(pdfText(`${debt.creditor || ""} · ${lent ? "Verilen borç" : "Alınan borç"}`), 44, 33);
+      doc.text(pdfText(`${debt.creditor || ""} · ${kindLine}`), 44, 33);
       let y = 44;
       doc.setFont(pdfFont, "bold"); doc.setFontSize(11);
-      doc.text(pdfText("Borç Bilgileri"), 14, y);
+      doc.text(pdfText(infoTitle), 14, y);
       autoTable(doc, {
         startY: y + 3,
         body: [
-          [lent ? "Borçlu" : "Alacaklı", debt.creditor || "—"],
-          ["Borç Türü", lent ? "Verilen borç (tahsil edilecek)" : "Alınan borç (ödenecek)"],
-          ["Kaynak / Açıklama", debt.source || "—"],
-          ["Borç Tarihi", debt.date ? fullDateLabel(debt.date) : "—"],
+          [personLabel, debt.creditor || "—"],
+          [typeLabel, typeValue],
+          [sourceLabel, debt.source || "—"],
+          [dateRowLabel, debt.date ? fullDateLabel(debt.date) : "—"],
           ["Vade", debt.due || "Açık"],
           ["Durum", debtStatusLabel(debt)],
         ].map((row) => row.map(pdfText)),
@@ -628,9 +730,125 @@ function App({ onSignOut }) {
         doc.setFont(pdfFont, "normal"); doc.setFontSize(8);
         doc.text(pdfText(`${selectedCompany?.name || "AYES GROUP"} · ${receiptTitle} · ${debt.creditor || ""} · Sayfa ${page} / ${pages}`), 14, 287);
       }
-      const slug = String(debt.creditor || "borc").toLocaleLowerCase("tr-TR").replace(/ğ/g, "g").replace(/ü/g, "u").replace(/ş/g, "s").replace(/ı/g, "i").replace(/ö/g, "o").replace(/ç/g, "c").replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "borc";
+      const slug = slugifyTr(debt.creditor, "borc");
       doc.save(`ayes-${lent ? "tahsilat" : "odeme"}-fisi-${slug}-${today}.pdf`);
-      flash("Borç fişi indirildi.");
+      flash(labels.done || "Borç fişi indirildi.");
+    } catch (error) {
+      flash(`Fiş oluşturulamadı: ${error?.message || error}`);
+    }
+  };
+  const exportCreditReceipt = (sale) => exportDebtReceipt(creditToDebtLike(sale || {}), { infoTitle: "Satış Bilgileri", typeLabel: "Satış Türü", lentType: "Vadeli satış (tahsil edilecek)", lentPerson: "Müşteri", lentKind: "Vadeli satış", sourceLabel: "Ürün / Açıklama", dateRowLabel: "Satış Tarihi", done: "Tahsilat fişi indirildi.", notFound: "Vadeli satış kaydı bulunamadı." });
+  const exportCustomerReceipt = async (customerName, customerSales) => {
+    try {
+      const sales = (customerSales || []).map(normalizeCreditSale).sort((left, right) => String(left.date).localeCompare(String(right.date)));
+      if (!sales.length) { flash("Bu müşteriye ait vadeli satış bulunamadı."); return; }
+      const name = String(customerName || sales[0].customer || "").trim() || "Müşteri";
+      const totals = sales.reduce((sum, sale) => { const amounts = creditAmounts(sale); return { total: sum.total + amounts.total, paid: sum.paid + amounts.paid, remaining: sum.remaining + amounts.remaining }; }, { total: 0, paid: 0, remaining: 0 });
+      const openCount = sales.filter((sale) => creditAmounts(sale).remaining > 0).length;
+      const doc = new jsPDF({ orientation: "portrait", unit: "mm", format: "a4" });
+      const pdfFont = await loadAyesFonts(doc);
+      if (pdfFont !== "Ayes") flash("Özel font yüklenemedi; standart fontla devam edildi.");
+      const logo = await loadLogoDataUrl();
+      if (logo) doc.addImage(logo, "PNG", 14, 10, 26, 26);
+      doc.setFont(pdfFont, "bold"); doc.setFontSize(16);
+      doc.text(pdfText(selectedCompany?.name || "AYES GROUP"), 44, 20);
+      doc.setFont(pdfFont, "normal"); doc.setFontSize(10);
+      doc.text(pdfText(`Müşteri Hesap Özeti · ${fullDateLabel(today)}`), 44, 27);
+      doc.text(pdfText(`${name} · ${sales.length} vadeli satış`), 44, 33);
+      let y = 44;
+      doc.setFont(pdfFont, "bold"); doc.setFontSize(11);
+      doc.text(pdfText("Müşteri Bilgileri"), 14, y);
+      autoTable(doc, {
+        startY: y + 3,
+        body: [
+          ["Müşteri", name],
+          ["Satış Sayısı", `${sales.length} vadeli satış · ${openCount} açık`],
+          ["Durum", totals.remaining > 0 ? "Açık bakiye var" : "Tüm satışlar tahsil edildi"],
+        ].map((row) => row.map(pdfText)),
+        theme: "plain",
+        styles: { font: pdfFont, fontSize: 9, cellPadding: 1.5 },
+        columnStyles: { 0: { fontStyle: "bold", cellWidth: 42, textColor: [90, 110, 112] }, 1: { cellWidth: "auto" } },
+      });
+      y = doc.lastAutoTable.finalY + 8;
+      autoTable(doc, {
+        startY: y,
+        head: [[pdfText("Toplam Tutar"), pdfText("Tahsil Edilen"), pdfText("Kalan")]],
+        body: [[amount(totals.total), amount(totals.paid), amount(totals.remaining)].map(pdfText)],
+        styles: { font: pdfFont, fontSize: 10, halign: "center" },
+        headStyles: { fillColor: [19, 38, 48] },
+      });
+      y = doc.lastAutoTable.finalY + 8;
+      if (y > 235) { doc.addPage(); y = 15; }
+      doc.setFont(pdfFont, "bold"); doc.setFontSize(11);
+      doc.text(pdfText("Vadeli Satışlar"), 14, y);
+      const saleRows = sales.map((sale, index) => {
+        const amounts = creditAmounts(sale);
+        const dueIsDate = /^\d{4}-\d{2}-\d{2}$/.test(sale.due || "");
+        return [String(index + 1), fullDateLabel(sale.date), creditProductLabel(sale), amount(amounts.total), amount(amounts.paid), amount(amounts.remaining), dueIsDate ? fullDateLabel(sale.due) : (sale.due || "Açık")];
+      });
+      autoTable(doc, {
+        startY: y + 3,
+        head: [["#", "Tarih", "Ürün", "Toplam", "Tahsil", "Kalan", "Vade"].map(pdfText)],
+        body: saleRows.map((row) => row.map(pdfText)),
+        styles: { font: pdfFont, fontSize: 8 },
+        headStyles: { fillColor: [19, 38, 48] },
+        columnStyles: { 0: { cellWidth: 8 }, 1: { cellWidth: 24 }, 3: { halign: "right", cellWidth: 26 }, 4: { halign: "right", cellWidth: 26 }, 5: { halign: "right", cellWidth: 26 }, 6: { cellWidth: 24 } },
+      });
+      y = doc.lastAutoTable.finalY + 7;
+      if (y > 255) { doc.addPage(); y = 15; }
+      doc.setFont(pdfFont, "bold"); doc.setFontSize(10);
+      doc.text(pdfText(`Toplam: ${amount(totals.total)} · Tahsil: ${amount(totals.paid)} · Kalan: ${amount(totals.remaining)}`), 196, y, { align: "right" });
+      y += 6;
+      const movements = [];
+      sales.forEach((sale) => {
+        const down = Math.max(0, toNumber(sale.downPayment));
+        if (down > 0) movements.push({ date: sale.date, sale: sale.product, note: "Peşinat", amount: down });
+        sale.transactions.forEach((txn) => movements.push({ date: txn.date, sale: sale.product, note: txn.note || "—", amount: toNumber(txn.amount) }));
+      });
+      movements.sort((left, right) => String(left.date).localeCompare(String(right.date)));
+      if (y > 245) { doc.addPage(); y = 15; } else { y += 4; }
+      doc.setFont(pdfFont, "bold"); doc.setFontSize(11);
+      doc.text(pdfText("Tahsilat Hareketleri"), 14, y);
+      if (!movements.length) {
+        doc.setFont(pdfFont, "normal"); doc.setFontSize(9); doc.setTextColor(130, 140, 142);
+        doc.text(pdfText("Henüz tahsilat işlenmedi."), 14, y + 7);
+        doc.setTextColor(0, 0, 0);
+        y += 12;
+      } else {
+        let running = totals.total;
+        const body = movements.map((move, index) => {
+          running = Math.max(0, running - Math.max(0, toNumber(move.amount)));
+          return [String(index + 1), fullDateLabel(move.date), move.sale, move.note, amount(move.amount), amount(running)];
+        });
+        autoTable(doc, {
+          startY: y + 3,
+          head: [["#", "Tarih", "Satış", "Açıklama", "Tutar", "Kalan"].map(pdfText)],
+          body: body.map((row) => row.map(pdfText)),
+          styles: { font: pdfFont, fontSize: 8 },
+          headStyles: { fillColor: [19, 38, 48] },
+          columnStyles: { 0: { cellWidth: 8 }, 1: { cellWidth: 24 }, 4: { halign: "right", cellWidth: 28 }, 5: { halign: "right", cellWidth: 28 } },
+        });
+        y = doc.lastAutoTable.finalY + 7;
+      }
+      if (y > 245) { doc.addPage(); y = 20; } else { y += 16; }
+      doc.setFont(pdfFont, "bold"); doc.setFontSize(10);
+      doc.text(pdfText("Teslim Eden"), 14, y);
+      doc.text(pdfText("Teslim Alan"), 110, y);
+      doc.setDrawColor(180, 190, 192);
+      doc.line(14, y + 18, 84, y + 18);
+      doc.line(110, y + 18, 180, y + 18);
+      doc.setFont(pdfFont, "normal"); doc.setFontSize(8); doc.setTextColor(130, 140, 142);
+      doc.text(pdfText("Ad Soyad / İmza"), 14, y + 24);
+      doc.text(pdfText("Ad Soyad / İmza"), 110, y + 24);
+      doc.setTextColor(0, 0, 0);
+      const pages = doc.getNumberOfPages();
+      for (let page = 1; page <= pages; page += 1) {
+        doc.setPage(page);
+        doc.setFont(pdfFont, "normal"); doc.setFontSize(8);
+        doc.text(pdfText(`${selectedCompany?.name || "AYES GROUP"} · Müşteri Hesap Özeti · ${name} · Sayfa ${page} / ${pages}`), 14, 287);
+      }
+      doc.save(`ayes-musteri-hesap-${slugifyTr(name, "musteri")}-${today}.pdf`);
+      flash("Müşteri hesap özeti indirildi.");
     } catch (error) {
       flash(`Fiş oluşturulamadı: ${error?.message || error}`);
     }
@@ -713,11 +931,21 @@ function App({ onSignOut }) {
     const selectedMaterial = (materials[selectedCompanyId] || []).find((material) => material.id === form.materialId);
     const materialName = form.materialMode === "new" ? String(form.materialName || "").trim() : selectedMaterial?.name || String(form.materialName || form.description || "").trim();
     const splitPayment = isSplitPayment(form.payment);
-    const previousSale = key === "sales" && form.id ? records.sales.find((row) => row.id === form.id) : null;
-    const saleStockPlan = key === "sales" ? planSaleStock(records.stock, previousSale, { materialId: selectedMaterial?.id || null, materialName, qty: toNumber(form.qty) }, stockAutomationEnabled || Boolean(previousSale?.stockDeducted)) : { nextStockRows: records.stock, stockMetadata: {} };
+    const isStockLinkedSale = key === "sales" || key === "creditSales";
+    const previousSale = isStockLinkedSale && form.id ? records[key].find((row) => row.id === form.id) : null;
+    const saleStockPlan = isStockLinkedSale ? planSaleStock(records.stock, previousSale, { materialId: selectedMaterial?.id || null, materialName, qty: toNumber(form.qty) }, stockAutomationEnabled || Boolean(previousSale?.stockDeducted)) : { nextStockRows: records.stock, stockMetadata: {} };
     if (saleStockPlan.error) { flash(saleStockPlan.error); return; }
     if (form.saveMaterial && materialName) addMaterial(materialName, form.unit || "adet");
     if (key === "sales") item = { ...common, customer: form.name || "Yeni müşteri", product: materialName || "Yeni ürün", qty: toNumber(form.qty), total: toNumber(form.amount), payment: form.payment, cashAmount: splitPayment ? toNumber(form.cashAmount) : null, mpesaAmount: splitPayment ? toNumber(form.mpesaAmount) : null, invoice: form.invoice || "Taslak", status: "Taslak", ...saleStockPlan.stockMetadata };
+    if (key === "creditSales") {
+      const creditTotal = Math.max(0, toNumber(form.amount));
+      const creditDown = Math.max(0, toNumber(form.downPayment));
+      if (!(creditTotal > 0)) { flash("Toplam tutar sıfırdan büyük olmalıdır."); return; }
+      if (creditDown - creditTotal > 1e-9) { flash("Peşinat toplam tutarı aşamaz."); return; }
+      const existingCredit = form.id ? records.creditSales.find((row) => row.id === form.id) : null;
+      const keptCreditTxns = existingCredit ? normalizeCreditSale(existingCredit).transactions : [];
+      item = { ...common, customer: form.name || "Yeni müşteri", product: materialName || "Vadeli satış", qty: toNumber(form.qty) > 0 ? toNumber(form.qty) : null, total: creditTotal, downPayment: creditDown, payment: form.payment, invoice: form.invoice || "", due: form.due || "Açık", transactions: keptCreditTxns, ...saleStockPlan.stockMetadata };
+    }
     if (key === "expenses") item = { ...common, category: form.category || "Genel gider", detail: form.description || "Yeni gider", note: form.note || "", workerId: form.category === "Çalışan Ödemesi" ? (form.workerId || null) : null, worker: form.category === "Çalışan Ödemesi" ? (form.worker || "") : "", amount: toNumber(form.amount), payment: form.payment, cashAmount: splitPayment ? toNumber(form.cashAmount) : null, mpesaAmount: splitPayment ? toNumber(form.mpesaAmount) : null, status: "Taslak" };
     if (key === "matExpenses") item = { ...common, product: materialName || "Yeni malzeme", color: form.color || "", package: form.package || "", length: form.length || "", unitPrice: hasValue(form.unitPrice) ? toNumber(form.unitPrice) : null, total: toNumber(form.amount) };
     if (key === "production") item = { ...common, product: materialName || "Yeni üretim", pallets: toNumber(form.pallets), qty: toNumber(form.qty), broken: toNumber(form.broken), cement: toNumber(form.cement), remaining: toNumber(form.remaining) };
@@ -727,14 +955,14 @@ function App({ onSignOut }) {
       if (!(toNumber(form.amount) > 0)) { flash("Tutar sıfırdan büyük olmalıdır."); return; }
       const existingDebt = form.id ? records.debts.find((row) => row.id === form.id) : null;
       const keptTransactions = existingDebt ? normalizeDebtRow(existingDebt).transactions : [];
-      item = { ...common, direction: form.direction === "lent" ? "lent" : "owed", creditor: form.name || "Yeni kayıt", source: form.description || "Genel borç", amount: Math.max(0, toNumber(form.amount)), transactions: keptTransactions, due: form.due || "Açık" };
+      item = { ...common, direction: "owed", creditor: form.name || "Yeni kayıt", source: form.description || "Genel borç", amount: Math.max(0, toNumber(form.amount)), transactions: keptTransactions, due: form.due || "Açık" };
     }
     const stockUpsertTarget = key === "stock" && !form.id ? records.stock.find((row) => row.companyId === selectedCompanyId && String(row.color || "") === String(item.color || "") && String(row.unit || "") === String(item.unit || "") && (item.materialId && row.materialId ? row.materialId === item.materialId : normalizeMaterialName(row.item) === normalizeMaterialName(item.item))) : null;
     setRecords((current) => {
       const upsertRow = stockUpsertTarget ? current.stock.find((row) => row.id === stockUpsertTarget.id) : null;
       const mergedStock = toNumber(upsertRow?.stock) + toNumber(item.stock);
       const rows = form.id ? current[key].map((row) => row.id === form.id ? item : row) : upsertRow ? current[key].map((row) => row.id === upsertRow.id ? { ...upsertRow, stock: mergedStock, state: stockStateFor(mergedStock, upsertRow.state), date: item.date } : row) : [item, ...current[key]];
-      let next = { ...current, [key]: rows, ...(key === "sales" ? { stock: saleStockPlan.nextStockRows } : {}) };
+      let next = { ...current, [key]: rows, ...(isStockLinkedSale ? { stock: saleStockPlan.nextStockRows } : {}) };
       if (key === "workers" || key === "expenses") next = withWorkerBalances(next);
       return next;
     });
@@ -750,10 +978,11 @@ function App({ onSignOut }) {
   const confirmDeleteRecord = () => {
     const pending = modal;
     if (!pending?.kind || !pending?.row) return;
-    const saleStockPlan = pending.kind === "sales" ? planSaleStock(records.stock, pending.row, null, false) : { nextStockRows: records.stock };
+    const restoresStock = pending.kind === "sales" || pending.kind === "creditSales";
+    const saleStockPlan = restoresStock ? planSaleStock(records.stock, pending.row, null, false) : { nextStockRows: records.stock };
     if (saleStockPlan.error) { flash(saleStockPlan.error); return; }
     setRecords((current) => {
-      const next = { ...current, [pending.kind]: current[pending.kind].filter((item) => item.id !== pending.row.id), ...(pending.kind === "sales" ? { stock: saleStockPlan.nextStockRows } : {}) };
+      const next = { ...current, [pending.kind]: current[pending.kind].filter((item) => item.id !== pending.row.id), ...(restoresStock ? { stock: saleStockPlan.nextStockRows } : {}) };
       return pending.kind === "expenses" ? withWorkerBalances(next) : next;
     });
     setModal(null);
@@ -770,6 +999,29 @@ function App({ onSignOut }) {
     flash(debtDirection(debt) === "lent" ? "Tahsilat kaydedildi." : "Ödeme kaydedildi.");
   };
 
+  const saveCreditTransaction = (saleId, txn) => {
+    const sale = records.creditSales.find((row) => row.id === saleId);
+    if (!sale) { flash("Vadeli satış kaydı bulunamadı."); return; }
+    const entry = { id: `txn-${Date.now()}`, date: txn.date || selectedDate, amount: Math.max(0, toNumber(txn.amount)), note: String(txn.note || "").trim(), payment: txn.payment || "" };
+    if (!(entry.amount > 0)) { flash("Tutar sıfırdan büyük olmalıdır."); return; }
+    setRecords((current) => ({ ...current, creditSales: current.creditSales.map((row) => row.id === saleId ? { ...normalizeCreditSale(row), transactions: [...normalizeCreditSale(row).transactions, entry] } : row) }));
+    setModal(null);
+    flash("Tahsilat kaydedildi.");
+  };
+
+  const saveCustomerCollection = (allocations, meta) => {
+    if (!allocations.length) { flash("Dağıtılacak tahsilat bulunamadı."); return; }
+    const stamp = Date.now();
+    setRecords((current) => ({ ...current, creditSales: current.creditSales.map((row) => {
+      const alloc = allocations.find((item) => item.saleId === row.id);
+      if (!alloc) return row;
+      const normalized = normalizeCreditSale(row);
+      return { ...normalized, transactions: [...normalized.transactions, { id: `txn-${stamp}-${row.id}`, date: meta.date || selectedDate, amount: alloc.amount, note: String(meta.note || "").trim(), payment: meta.payment || "" }] };
+    }) }));
+    setModal(null);
+    flash(`${allocations.length} satışa tahsilat dağıtıldı.`);
+  };
+
   const pageTitle = activeView === "overview" ? "Genel bakış" : activeView === "daily" ? "Günlük kontrol" : viewCopy[activeView].title;
   const pageDescription = activeView === "overview" ? "İşletmenizin finansal ve operasyonel durumunu tek ekranda takip edin." : activeView === "daily" ? "Günlük işlemlerin tamamlanma durumunu ve kayıt özetini takip edin." : viewCopy[activeView].description;
 
@@ -784,18 +1036,21 @@ function App({ onSignOut }) {
       <header className="topbar"><div className="topbar-left"><button className="mobile-menu-button" onClick={() => setMobileMenuOpen(true)}><Icon name="grid" size={18}/></button><div className="breadcrumbs"><span>İşletme</span><Icon name="chevronRight" size={14}/><strong>{selectedCompany?.name}</strong></div></div><div className="topbar-actions"><div className="sync-status"><span className="pulse"/> {syncState}</div><div className="top-date"><Icon name="calendar" size={16}/><input type="date" value={selectedDate} onChange={(event) => setSelectedDate(event.target.value)}/></div></div></header>
       <div className="page-wrap">
         <div className="page-heading"><div><div className="eyebrow">{activeView === "overview" ? "İŞLETME ÖZETİ" : activeView === "daily" ? "GÜN KAPANIŞI" : viewCopy[activeView].kicker}</div><h1>{pageTitle}</h1><p>{pageDescription}</p></div><div className="heading-actions"><button className="button secondary keep-mobile" onClick={() => exportData("pdf")}><Icon name="download" size={16}/> Rapor al</button>{activeView !== "history" && activeView !== "dailyRecords" && <button className="button primary" onClick={() => setModal({ type: "entry", kind: activeView === "overview" || activeView === "daily" ? "sales" : activeView })}><Icon name="plus" size={17}/> {activeView === "overview" || activeView === "daily" ? "Yeni kayıt" : viewCopy[activeView].primary}</button>}</div></div>
-        {activeView === "overview" && <Dashboard selectedRecords={selectedRecords} salesTotal={salesTotal} expenseTotal={expenseTotal} debtTotal={debtTotal} selectedDate={selectedDate} onNavigate={navigate} onAdd={() => setModal({ type: "entry", kind: "sales" })} onEdit={(kind, row) => setModal({ type: "entry", kind, edit: row })} />}
-        {activeView === "daily" && <DailyControl selectedDate={selectedDate} selectedRecords={selectedRecords} onNavigate={navigate} />}
+        {activeView === "overview" && <Dashboard selectedRecords={selectedRecords} incomeTotal={incomeTotal} incomeEvents={incomeData.events} expenseTotal={expenseTotal} debtTotal={debtTotal} creditOpenTotal={creditOpenTotal} openCreditCount={openCreditCount} selectedDate={selectedDate} onNavigate={navigate} onAdd={() => setModal({ type: "entry", kind: "sales" })} onEdit={(kind, row) => setModal({ type: "entry", kind, edit: row })} />}
+        {activeView === "daily" && <DailyControl selectedDate={selectedDate} selectedRecords={selectedRecords} incomeEvents={incomeData.events} onNavigate={navigate} />}
         {activeView === "dailyRecords" && <DailyRecordsPage selectedRecords={selectedRecords} />}
         {activeView === "history" && <HistoricalPeriods selectedRecords={selectedRecords} />}
-        {activeView !== "overview" && activeView !== "daily" && activeView !== "dailyRecords" && activeView !== "history" && <ModuleView key={activeView} activeView={activeView} records={selectedRecords[activeView] || []} query={query} setQuery={setQuery} onAdd={() => setModal({ type: "entry", kind: activeView })} onEdit={(row) => setModal({ type: "entry", kind: activeView, edit: row })} onDelete={(row) => deleteRecord(activeView, row)} onDetail={activeView === "workers" ? (row) => setModal({ type: "worker-detail", worker: row }) : activeView === "debts" ? (row) => setModal({ type: "debt-detail", debtId: row.id }) : undefined} onPay={activeView === "debts" ? (row) => setModal({ type: "debt-pay", debtId: row.id }) : undefined} onPrint={activeView === "debts" ? exportDebtReceipt : undefined} />}
+        {activeView !== "overview" && activeView !== "daily" && activeView !== "dailyRecords" && activeView !== "history" && <ModuleView key={activeView} activeView={activeView} records={selectedRecords[activeView] || []} query={query} setQuery={setQuery} onAdd={() => setModal({ type: "entry", kind: activeView })} onEdit={(row) => setModal({ type: "entry", kind: activeView, edit: row })} onDelete={(row) => deleteRecord(activeView, row)} onDetail={activeView === "workers" ? (row) => setModal({ type: "worker-detail", worker: row }) : activeView === "debts" ? (row) => setModal({ type: "debt-detail", debtId: row.id }) : activeView === "creditSales" ? (row) => setModal({ type: "credit-detail", saleId: row.id }) : undefined} onPay={activeView === "debts" ? (row) => setModal({ type: "debt-pay", debtId: row.id }) : activeView === "creditSales" ? (row) => setModal({ type: "credit-pay", saleId: row.id }) : undefined} onPrint={activeView === "debts" ? exportDebtReceipt : activeView === "creditSales" ? exportCreditReceipt : undefined} onCollect={activeView === "creditSales" ? (customer) => setModal({ type: "credit-collect", customer }) : undefined} onPrintCustomer={activeView === "creditSales" ? (customer) => exportCustomerReceipt(customer, selectedRecords.creditSales.filter((row) => normalizeCustomerName(row.customer) === normalizeCustomerName(customer))) : undefined} />}
       </div>
     </main>
     <input ref={fileInputRef} type="file" accept="application/json,.json" hidden onChange={handleImportFile}/>
-    {modal?.type === "entry" && <EntryModal kind={modal.kind} edit={modal.edit} date={selectedDate} paymentMethods={paymentMethods} colors={colors} workers={selectedRecords.workers} materials={materials[selectedCompanyId] || []} onAddMaterial={addMaterial} onClose={() => setModal(null)} onSave={saveRecord}/>} 
+    {modal?.type === "entry" && <EntryModal kind={modal.kind} edit={modal.edit} date={selectedDate} paymentMethods={paymentMethods} colors={colors} workers={selectedRecords.workers} customers={creditCustomerNames} materials={materials[selectedCompanyId] || []} onAddMaterial={addMaterial} onClose={() => setModal(null)} onSave={saveRecord}/>} 
     {modal?.type === "worker-detail" && <WorkerDetailModal worker={modal.worker} expenses={selectedRecords.expenses} onClose={() => setModal(null)}/>}
     {modal?.type === "debt-pay" && <DebtPaymentModal debt={selectedRecords.debts.find((row) => row.id === modal.debtId)} onClose={() => setModal(null)} onSave={saveDebtTransaction}/>}
     {modal?.type === "debt-detail" && <DebtDetailModal debt={selectedRecords.debts.find((row) => row.id === modal.debtId)} onClose={() => setModal(null)} onPay={(row) => setModal({ type: "debt-pay", debtId: row.id })} onPrint={exportDebtReceipt}/>} 
+    {modal?.type === "credit-pay" && <DebtPaymentModal debt={creditToDebtLike(selectedRecords.creditSales.find((row) => row.id === modal.saleId))} paymentMethods={paymentMethods} enablePayment onClose={() => setModal(null)} onSave={saveCreditTransaction}/>}
+    {modal?.type === "credit-detail" && <CreditDetailModal sale={selectedRecords.creditSales.find((row) => row.id === modal.saleId)} onClose={() => setModal(null)} onPay={(row) => setModal({ type: "credit-pay", saleId: row.id })} onPrint={exportCreditReceipt}/>} 
+    {modal?.type === "credit-collect" && <CustomerCollectionModal customer={modal.customer} sales={selectedRecords.creditSales.filter((row) => normalizeCustomerName(row.customer) === normalizeCustomerName(modal.customer))} paymentMethods={paymentMethods} onClose={() => setModal(null)} onSave={saveCustomerCollection}/>}
     {modal?.type === "settings" && <SettingsModal companyName={selectedCompany?.name || "AYES GROUP"} paymentMethods={paymentMethods} colors={colors} materials={materials[selectedCompanyId] || []} stockAutomationEnabled={stockAutomationEnabled} onToggleStockAutomation={setStockAutomationEnabled} onAddPayment={addPaymentMethod} onRemovePayment={removePaymentMethod} onAddColor={addColor} onRemoveColor={removeColor} onAddMaterial={addMaterial} onRemoveMaterial={removeMaterial} onExport={exportData} onImport={() => fileInputRef.current?.click()} onSignOut={onSignOut} onClose={() => setModal(null)}/>} 
     {modal?.type === "confirm-record-delete" && <ConfirmModal message={`${modal.recordName} kaydı silinsin mi?`} confirmLabel="Kaydı sil" onClose={() => setModal(null)} onConfirm={confirmDeleteRecord}/>} 
     {modal?.type === "confirm-payment-delete" && <ConfirmModal message={`${modal.method} ödeme yöntemi silinsin mi?`} confirmLabel="Ödeme yöntemini sil" onClose={() => setModal(null)} onConfirm={confirmRemovePaymentMethod}/>} 
@@ -811,15 +1066,10 @@ function HistoricalPeriods({ selectedRecords }) {
   const reports = useMemo(() => {
     const monthMap = new Map();
     const ensureReport = (month) => {
-      if (!monthMap.has(month)) monthMap.set(month, { key: month, salesTotal: 0, expenseTotal: 0, salesCount: 0, expenseCount: 0, productionQty: 0, brokenQty: 0, stockCount: 0, debtCount: 0, cashIn: 0, mpesaIn: 0, cashOut: 0, mpesaOut: 0, activeDays: new Set() });
+      if (!monthMap.has(month)) monthMap.set(month, { key: month, salesTotal: 0, expenseTotal: 0, salesCount: 0, collectionTotal: 0, collectionCount: 0, creditCount: 0, expenseCount: 0, productionQty: 0, brokenQty: 0, stockCount: 0, debtCount: 0, cashIn: 0, mpesaIn: 0, cashOut: 0, mpesaOut: 0, activeDays: new Set() });
       return monthMap.get(month);
     };
-    const paymentAmounts = (row, amount) => {
-      if (hasValue(row.cashAmount) || hasValue(row.mpesaAmount)) return { cash: toNumber(row.cashAmount), mpesa: toNumber(row.mpesaAmount) };
-      if (/m-pesa/i.test(String(row.payment || ""))) return { cash: 0, mpesa: amount };
-      if (/nakit/i.test(String(row.payment || ""))) return { cash: amount, mpesa: 0 };
-      return { cash: 0, mpesa: 0 };
-    };
+    const paymentAmounts = splitPaymentAmounts;
     const forEachHistoricalRecord = (rows, callback) => rows.forEach((row) => {
       const date = String(row.date || "");
       const month = date.slice(0, 7);
@@ -831,6 +1081,24 @@ function HistoricalPeriods({ selectedRecords }) {
       const payment = paymentAmounts(row, amount);
       report.salesTotal += amount; report.salesCount += 1; report.cashIn += payment.cash; report.mpesaIn += payment.mpesa; report.activeDays.add(date);
     });
+    forEachHistoricalRecord(selectedRecords.creditSales, (report, row, date) => {
+      report.creditCount += 1;
+      const down = Math.max(0, toNumber(row.downPayment));
+      if (down > 0) {
+        const payment = paymentAmounts({ payment: row.payment }, down);
+        report.salesTotal += down; report.collectionTotal += down; report.collectionCount += 1; report.cashIn += payment.cash; report.mpesaIn += payment.mpesa;
+      }
+      report.activeDays.add(date);
+    });
+    (selectedRecords.creditSales || []).forEach((sale) => (normalizeCreditSale(sale).transactions || []).forEach((txn) => {
+      const txnDate = String(txn.date || "");
+      const txnMonth = txnDate.slice(0, 7);
+      if (!/^\d{4}-\d{2}$/.test(txnMonth) || txnMonth >= currentMonthKey) return;
+      const report = ensureReport(txnMonth);
+      const txnAmount = toNumber(txn.amount);
+      const payment = paymentAmounts(txn, txnAmount);
+      report.salesTotal += txnAmount; report.collectionTotal += txnAmount; report.collectionCount += 1; report.cashIn += payment.cash; report.mpesaIn += payment.mpesa; report.activeDays.add(txnDate);
+    }));
     forEachHistoricalRecord(selectedRecords.expenses, (report, row, date) => {
       const amount = toNumber(row.amount);
       const payment = paymentAmounts(row, amount);
@@ -844,26 +1112,29 @@ function HistoricalPeriods({ selectedRecords }) {
   const monthLabel = (month) => new Intl.DateTimeFormat("tr-TR", { month: "long", year: "numeric" }).format(new Date(`${month}-01T12:00:00`));
   const monthEndLabel = (month) => { const [year, monthNumber] = month.split("-").map(Number); return new Intl.DateTimeFormat("tr-TR", { day: "numeric", month: "long", year: "numeric" }).format(new Date(year, monthNumber, 0, 12)); };
   if (!reports.length) return <div className="history-page"><section className="panel history-empty"><span className="empty-icon"><Icon name="receipt" size={20}/></span><h2>Henüz kapanmış ay raporu yok</h2><p>Geçmiş dönemler, yalnızca mevcut aydan önceki aylarda kayıt oluştuğunda burada görünür.</p></section></div>;
-  return <div className="history-page"><section className="history-intro"><div><div className="eyebrow">KAPANMIŞ DÖNEMLER</div><h2>Ay sonu rapor arşivi</h2><p>Bu sayfada yalnızca tamamlanmış ayların toplu sonuçları gösterilir. Günlük kayıtlar ilgili modüllerde kalır.</p></div><div className="history-count"><span>Raporlanan ay</span><strong>{reports.length}</strong></div></section><div className="history-list">{reports.map((report) => { const expanded = expandedMonth === report.key; return <article className={`panel history-card ${expanded ? "expanded" : ""}`} key={report.key}><button className="history-card-head" onClick={() => setExpandedMonth(expanded ? null : report.key)} aria-expanded={expanded}><div className="history-month-title"><span className="history-month-icon"><Icon name="calendar" size={18}/></span><div><div className="panel-kicker">AY SONU RAPORU</div><h3>{monthLabel(report.key)}</h3><p>{monthEndLabel(report.key)} kapanışı · {report.activeDayCount} aktif gün</p></div></div><div className="history-net"><span>Net sonuç</span><strong className={report.net < 0 ? "negative" : "positive"}>{amount(report.net)}</strong><Icon name="chevron" size={17}/></div></button><div className="history-metrics"><div><span>Toplam gelir</span><strong>{amount(report.salesTotal)}</strong><small>{report.salesCount} satış</small></div><div><span>Toplam gider</span><strong>{amount(report.expenseTotal)}</strong><small>{report.expenseCount} gider</small></div><div><span>Üretim</span><strong>{money(report.productionQty)}</strong><small>{money(report.brokenQty)} fire</small></div><div><span>Ödeme girişleri</span><strong>{amount(report.cashIn + report.mpesaIn)}</strong><small>Nakit {amount(report.cashIn)} · Diğer {amount(report.mpesaIn)}</small></div></div>{expanded && <div className="history-detail"><div><span>Ödeme çıkışları</span><strong>Nakit {amount(report.cashOut)}</strong><small>Diğer {amount(report.mpesaOut)}</small></div><div><span>Stok kayıtları</span><strong>{report.stockCount}</strong><small>Bu ay işlenen hareket</small></div><div><span>Borç kayıtları</span><strong>{report.debtCount}</strong><small>Bu ay açılan/işlenen kayıt</small></div></div>}</article>; })}</div></div>;
+  return <div className="history-page"><section className="history-intro"><div><div className="eyebrow">KAPANMIŞ DÖNEMLER</div><h2>Ay sonu rapor arşivi</h2><p>Bu sayfada yalnızca tamamlanmış ayların toplu sonuçları gösterilir. Günlük kayıtlar ilgili modüllerde kalır.</p></div><div className="history-count"><span>Raporlanan ay</span><strong>{reports.length}</strong></div></section><div className="history-list">{reports.map((report) => { const expanded = expandedMonth === report.key; return <article className={`panel history-card ${expanded ? "expanded" : ""}`} key={report.key}><button className="history-card-head" onClick={() => setExpandedMonth(expanded ? null : report.key)} aria-expanded={expanded}><div className="history-month-title"><span className="history-month-icon"><Icon name="calendar" size={18}/></span><div><div className="panel-kicker">AY SONU RAPORU</div><h3>{monthLabel(report.key)}</h3><p>{monthEndLabel(report.key)} kapanışı · {report.activeDayCount} aktif gün</p></div></div><div className="history-net"><span>Net sonuç</span><strong className={report.net < 0 ? "negative" : "positive"}>{amount(report.net)}</strong><Icon name="chevron" size={17}/></div></button><div className="history-metrics"><div><span>Toplam gelir</span><strong>{amount(report.salesTotal)}</strong><small>{report.salesCount} peşin · {report.collectionCount} tahsilat</small></div><div><span>Toplam gider</span><strong>{amount(report.expenseTotal)}</strong><small>{report.expenseCount} gider</small></div><div><span>Üretim</span><strong>{money(report.productionQty)}</strong><small>{money(report.brokenQty)} fire</small></div><div><span>Ödeme girişleri</span><strong>{amount(report.cashIn + report.mpesaIn)}</strong><small>Nakit {amount(report.cashIn)} · Diğer {amount(report.mpesaIn)}</small></div></div>{expanded && <div className="history-detail"><div><span>Ödeme çıkışları</span><strong>Nakit {amount(report.cashOut)}</strong><small>Diğer {amount(report.mpesaOut)}</small></div><div><span>Stok kayıtları</span><strong>{report.stockCount}</strong><small>Bu ay işlenen hareket</small></div><div><span>Borç kayıtları</span><strong>{report.debtCount}</strong><small>Bu ay açılan/işlenen kayıt</small></div><div><span>Tahsilatlar</span><strong>{amount(report.collectionTotal)}</strong><small>{report.collectionCount} işlem · {report.creditCount} vadeli satış</small></div></div>}</article>; })}</div></div>;
 }
 
-function Dashboard({ selectedRecords, salesTotal, expenseTotal, debtTotal, selectedDate, onNavigate, onAdd, onEdit }) {
+function Dashboard({ selectedRecords, incomeTotal, incomeEvents, expenseTotal, debtTotal, creditOpenTotal, openCreditCount, selectedDate, onNavigate, onAdd, onEdit }) {
   const latestSales = selectedRecords.sales.slice(0, 5);
   const owedDebtCount = selectedRecords.debts.filter((row) => debtDirection(row) !== "lent").length;
-  const salesTrend = trendFor(selectedRecords.sales, (row) => toNumber(row.total), selectedDate);
+  const collectionEvents = (incomeEvents || []).filter((event) => event.kind !== "cash");
+  const incomeTrend = trendFor(incomeEvents || [], (row) => toNumber(row.amount), selectedDate);
   const expenseTrend = trendFor(selectedRecords.expenses, (row) => toNumber(row.amount), selectedDate);
   const debtTrend = trendFor(selectedRecords.debts, (row) => toNumber(row.amount), selectedDate);
   const stockTrend = trendFor(selectedRecords.stock, (row) => toNumber(row.stock), selectedDate);
+  const collectionTrend = trendFor(collectionEvents, (row) => toNumber(row.amount), selectedDate);
   const lowStockCount = selectedRecords.stock.filter((row) => row.state === "Düşük").length;
   const stockDetail = selectedRecords.stock.length ? `${selectedRecords.stock.length} kalem · ${lowStockCount} düşük` : "Henüz stok kaydı yok";
+  const creditCustomerCount = groupCreditSalesByCustomer(selectedRecords.creditSales).length;
   return <>
-    <div className="metric-grid"><MetricCard label="Toplam gelir" value={amount(salesTotal)} detail={`${selectedRecords.sales.length} satış kaydı`} icon="arrowUp" tone="green" trend={salesTrend}/><MetricCard label="Toplam gider" value={amount(expenseTotal)} detail={`${selectedRecords.expenses.length} gider kaydı`} icon="arrowDown" tone="peach" trend={expenseTrend}/><MetricCard label="Açık borç" value={amount(debtTotal)} detail={`${owedDebtCount} alınan borç kaydı`} icon="receipt" tone="lilac" trend={debtTrend}/><MetricCard label="Stok kalemi" value={selectedRecords.stock.length} detail={stockDetail} icon="box" tone="blue" trend={stockTrend}/></div>
-    <div className="dashboard-grid single-panel-grid"><RevenueChart selectedRecords={selectedRecords} selectedDate={selectedDate}/></div>
+    <div className="metric-grid"><MetricCard label="Toplam gelir" value={amount(incomeTotal)} detail={`${selectedRecords.sales.length} peşin · ${collectionEvents.length} tahsilat`} icon="arrowUp" tone="green" trend={incomeTrend}/><MetricCard label="Toplam gider" value={amount(expenseTotal)} detail={`${selectedRecords.expenses.length} gider kaydı`} icon="arrowDown" tone="peach" trend={expenseTrend}/><MetricCard label="Açık borç" value={amount(debtTotal)} detail={`${owedDebtCount} alınan borç kaydı`} icon="receipt" tone="lilac" trend={debtTrend}/><MetricCard label="Bekleyen tahsilat" value={amount(creditOpenTotal)} detail={`${openCreditCount} açık satış · ${creditCustomerCount} müşteri`} icon="briefcase" tone="teal" trend={collectionTrend}/><MetricCard label="Stok kalemi" value={selectedRecords.stock.length} detail={stockDetail} icon="box" tone="blue" trend={stockTrend}/></div>
+    <div className="dashboard-grid single-panel-grid"><RevenueChart selectedRecords={selectedRecords} selectedDate={selectedDate} incomeEvents={incomeEvents}/></div>
     <div className="dashboard-grid single-panel-grid"><RecentActivity rows={latestSales} onNavigate={onNavigate} onEdit={onEdit} onAdd={onAdd}/></div>
   </>;
 }
 
-function RevenueChart({ selectedRecords, selectedDate }) {
+function RevenueChart({ selectedRecords, selectedDate, incomeEvents }) {
   const [rangeDays, setRangeDays] = useState(7);
   const periodRows = useMemo(() => {
     const end = new Date(`${selectedDate}T12:00:00`);
@@ -871,11 +1142,11 @@ function RevenueChart({ selectedRecords, selectedDate }) {
       const date = new Date(end);
       date.setDate(end.getDate() - (rangeDays - index - 1));
       const key = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
-      const sales = selectedRecords.sales.filter((row) => row.date === key).reduce((sum, row) => sum + toNumber(row.total), 0);
+      const sales = (incomeEvents || []).filter((event) => event.date === key).reduce((sum, event) => sum + toNumber(event.amount), 0);
       const expenses = selectedRecords.expenses.filter((row) => row.date === key).reduce((sum, row) => sum + toNumber(row.amount), 0);
       return { date: key, sales, expenses };
     });
-  }, [rangeDays, selectedDate, selectedRecords.sales, selectedRecords.expenses]);
+  }, [rangeDays, selectedDate, incomeEvents, selectedRecords.expenses]);
   const salesTotal = periodRows.reduce((sum, row) => sum + row.sales, 0);
   const expenseTotal = periodRows.reduce((sum, row) => sum + row.expenses, 0);
   const maxValue = Math.max(...periodRows.map((row) => Math.max(row.sales, row.expenses)), 0);
@@ -890,22 +1161,23 @@ function RevenueChart({ selectedRecords, selectedDate }) {
 }
 
 function RecentActivity({ rows, onNavigate, onEdit, onAdd }) {
-  return <section className="panel activity-panel"><div className="panel-head"><div><div className="panel-kicker">SON HAREKETLER</div><h2>Son satış kayıtları</h2></div><button className="text-button" onClick={() => onNavigate("sales")}>Tümünü gör <Icon name="chevronRight" size={14}/></button></div><div className="table-wrap"><table><thead><tr><th>Müşteri</th><th>Malzeme</th><th>Ödeme</th><th className="align-right">Tutar</th><th></th></tr></thead><tbody>{rows.length ? rows.map((row) => <tr key={row.id}><td><div className="person-cell"><span className="row-avatar">{(row.customer || "?").slice(0, 1)}</span><span><strong>{row.customer}</strong><small>{row.invoice} · {dateLabel(row.date)}</small></span></div></td><td>{row.product}</td><td><Badge tone={(row.payment || "").includes("M-Pesa") ? "teal" : "neutral"}>{row.payment}</Badge></td><td className="align-right amount">{amount(row.total)}</td><td><button className="row-action" onClick={() => onEdit("sales", row)} aria-label="Düzenle"><Icon name="edit" size={15}/></button></td></tr>) : <tr><td colSpan="5"><div className="empty-table-state"><span className="empty-icon"><Icon name="receipt" size={19}/></span><strong>Henüz satış kaydı yok</strong><span>İlk satış kaydınızı eklediğinizde burada görünecek.</span></div></td></tr>}</tbody></table></div><button className="add-row" onClick={onAdd}><Icon name="plus" size={15}/> Yeni satış kaydı ekle</button></section>;
+  return <section className="panel activity-panel"><div className="panel-head"><div><div className="panel-kicker">SON HAREKETLER</div><h2>Son peşin satışlar</h2></div><button className="text-button" onClick={() => onNavigate("sales")}>Tümünü gör <Icon name="chevronRight" size={14}/></button></div><div className="table-wrap"><table><thead><tr><th>Müşteri</th><th>Malzeme</th><th>Ödeme</th><th className="align-right">Tutar</th><th></th></tr></thead><tbody>{rows.length ? rows.map((row) => <tr key={row.id}><td><div className="person-cell"><span className="row-avatar">{(row.customer || "?").slice(0, 1)}</span><span><strong>{row.customer}</strong><small>{row.invoice} · {dateLabel(row.date)}</small></span></div></td><td>{row.product}</td><td><Badge tone={(row.payment || "").includes("M-Pesa") ? "teal" : "neutral"}>{row.payment}</Badge></td><td className="align-right amount">{amount(row.total)}</td><td><button className="row-action" onClick={() => onEdit("sales", row)} aria-label="Düzenle"><Icon name="edit" size={15}/></button></td></tr>) : <tr><td colSpan="5"><div className="empty-table-state"><span className="empty-icon"><Icon name="receipt" size={19}/></span><strong>Henüz satış kaydı yok</strong><span>İlk satış kaydınızı eklediğinizde burada görünecek.</span></div></td></tr>}</tbody></table></div><button className="add-row" onClick={onAdd}><Icon name="plus" size={15}/> Yeni satış kaydı ekle</button></section>;
 }
 
-function DailyControl({ selectedDate, selectedRecords, onNavigate }) {
+function DailyControl({ selectedDate, selectedRecords, incomeEvents, onNavigate }) {
   const dayRecords = (kind) => selectedRecords[kind].filter((row) => row.date === selectedDate);
   const dailySales = dayRecords("sales");
   const dailyExpenses = dayRecords("expenses");
   const dailyProduction = dayRecords("production");
-  const salesTotal = dailySales.reduce((sum, row) => sum + toNumber(row.total), 0);
+  const dayIncomeEvents = (incomeEvents || []).filter((event) => event.date === selectedDate);
+  const dayIncome = dayIncomeEvents.reduce((sum, event) => sum + toNumber(event.amount), 0);
   const expenseTotal = dailyExpenses.reduce((sum, row) => sum + toNumber(row.amount), 0);
   const productionTotal = dailyProduction.reduce((sum, row) => sum + toNumber(row.qty), 0);
   const brokenTotal = dailyProduction.reduce((sum, row) => sum + toNumber(row.broken), 0);
   const hasRecords = dailySales.length || dailyExpenses.length || dailyProduction.length;
   const completedSections = [dailySales.length > 0, dailyExpenses.length > 0, dailyProduction.length > 0].filter(Boolean).length;
   const controlScore = Math.round(completedSections / 3 * 100);
-  return <div className="daily-page"><div className="daily-hero"><div><div className="eyebrow">{dateLabel(selectedDate)} · GÜN KAPANIŞI</div><h2>Bugünün kontrol listesi</h2><p>İşletmenin günlük gelir, gider ve üretim kayıtlarını aynı gün içinde tamamlayın. Gün sonu özeti kayıtlardan otomatik oluşur.</p></div><div className="daily-score"><span>Kontrol skoru</span><strong>{controlScore}%</strong><div className="progress-track"><span style={{ width: `${controlScore}%` }}/></div></div></div><div className="checklist-grid"><div className={`check-card ${dailySales.length ? "done" : ""}`}><span className="check-circle"><Icon name={dailySales.length ? "check" : "arrowUp"} size={15}/></span><div><strong>Satış kayıtları</strong><span>{dailySales.length ? `${dailySales.length} satış kaydı işlendi` : "Henüz kayıt yok"}</span></div><Badge tone={dailySales.length ? "success" : "warning"}>{dailySales.length ? "Tamam" : "Bekliyor"}</Badge></div><div className={`check-card ${dailyProduction.length ? "done" : ""}`}><span className="check-circle muted"><Icon name="box" size={15}/></span><div><strong>Üretim kaydı</strong><span>{dailyProduction.length ? `${dailyProduction.length} üretim kaydı işlendi` : "Henüz kayıt yok"}</span></div><Badge tone={dailyProduction.length ? "success" : "warning"}>{dailyProduction.length ? "Tamam" : "Bekliyor"}</Badge></div><div className="check-card done"><span className="check-circle muted"><Icon name="refresh" size={15}/></span><div><strong>Gün sonu özeti</strong><span>Kayıtlardan otomatik oluşturulur</span></div><Badge tone="success">Otomatik</Badge></div><div className={`check-card ${dailyExpenses.length ? "done" : ""}`}><span className="check-circle"><Icon name={dailyExpenses.length ? "check" : "arrowDown"} size={15}/></span><div><strong>Gider kayıtları</strong><span>{dailyExpenses.length ? `${dailyExpenses.length} gider kaydı işlendi` : "Henüz kayıt yok"}</span></div><Badge tone={dailyExpenses.length ? "success" : "warning"}>{dailyExpenses.length ? "Tamam" : "Bekliyor"}</Badge></div></div><div className="daily-bottom"><div className="panel mini-panel"><div className="panel-head"><div><div className="panel-kicker">GÜNLÜK ÖZET</div><h2>Hareket özeti</h2></div></div><div className="daily-summary-grid"><div><span>Gelir</span><strong>{amount(salesTotal)}</strong><small>{dailySales.length} işlem</small></div><div><span>Gider</span><strong>{amount(expenseTotal)}</strong><small>{dailyExpenses.length} işlem</small></div><div><span>Üretim</span><strong>{money(productionTotal)}</strong><small>adet</small></div><div><span>Fire</span><strong>{money(brokenTotal)}</strong><small>adet</small></div></div></div><div className="panel note-panel"><div className="panel-kicker">GÜN NOTU</div><h2>{hasRecords ? "Gün özeti hazır" : "Henüz kayıt yok"}</h2><p>{hasRecords ? "Bu günün raporu günlük kayıtlar ekranında da otomatik olarak görüntülenir." : "İlk işlemi eklediğinizde bu günün kontrol adımları burada görünecek."}</p><button className="text-button" onClick={() => onNavigate("dailyRecords")}>Günlük kayıtlara git <Icon name="chevronRight" size={14}/></button></div></div></div>;
+  return <div className="daily-page"><div className="daily-hero"><div><div className="eyebrow">{dateLabel(selectedDate)} · GÜN KAPANIŞI</div><h2>Bugünün kontrol listesi</h2><p>İşletmenin günlük gelir, gider ve üretim kayıtlarını aynı gün içinde tamamlayın. Gün sonu özeti kayıtlardan otomatik oluşur.</p></div><div className="daily-score"><span>Kontrol skoru</span><strong>{controlScore}%</strong><div className="progress-track"><span style={{ width: `${controlScore}%` }}/></div></div></div><div className="checklist-grid"><div className={`check-card ${dailySales.length ? "done" : ""}`}><span className="check-circle"><Icon name={dailySales.length ? "check" : "arrowUp"} size={15}/></span><div><strong>Satış kayıtları</strong><span>{dailySales.length ? `${dailySales.length} satış kaydı işlendi` : "Henüz kayıt yok"}</span></div><Badge tone={dailySales.length ? "success" : "warning"}>{dailySales.length ? "Tamam" : "Bekliyor"}</Badge></div><div className={`check-card ${dailyProduction.length ? "done" : ""}`}><span className="check-circle muted"><Icon name="box" size={15}/></span><div><strong>Üretim kaydı</strong><span>{dailyProduction.length ? `${dailyProduction.length} üretim kaydı işlendi` : "Henüz kayıt yok"}</span></div><Badge tone={dailyProduction.length ? "success" : "warning"}>{dailyProduction.length ? "Tamam" : "Bekliyor"}</Badge></div><div className="check-card done"><span className="check-circle muted"><Icon name="refresh" size={15}/></span><div><strong>Gün sonu özeti</strong><span>Kayıtlardan otomatik oluşturulur</span></div><Badge tone="success">Otomatik</Badge></div><div className={`check-card ${dailyExpenses.length ? "done" : ""}`}><span className="check-circle"><Icon name={dailyExpenses.length ? "check" : "arrowDown"} size={15}/></span><div><strong>Gider kayıtları</strong><span>{dailyExpenses.length ? `${dailyExpenses.length} gider kaydı işlendi` : "Henüz kayıt yok"}</span></div><Badge tone={dailyExpenses.length ? "success" : "warning"}>{dailyExpenses.length ? "Tamam" : "Bekliyor"}</Badge></div></div><div className="daily-bottom"><div className="panel mini-panel"><div className="panel-head"><div><div className="panel-kicker">GÜNLÜK ÖZET</div><h2>Hareket özeti</h2></div></div><div className="daily-summary-grid"><div><span>Gelir</span><strong>{amount(dayIncome)}</strong><small>{dayIncomeEvents.length} işlem</small></div><div><span>Gider</span><strong>{amount(expenseTotal)}</strong><small>{dailyExpenses.length} işlem</small></div><div><span>Üretim</span><strong>{money(productionTotal)}</strong><small>adet</small></div><div><span>Fire</span><strong>{money(brokenTotal)}</strong><small>adet</small></div></div></div><div className="panel note-panel"><div className="panel-kicker">GÜN NOTU</div><h2>{hasRecords ? "Gün özeti hazır" : "Henüz kayıt yok"}</h2><p>{hasRecords ? "Bu günün raporu günlük kayıtlar ekranında da otomatik olarak görüntülenir." : "İlk işlemi eklediğinizde bu günün kontrol adımları burada görünecek."}</p><button className="text-button" onClick={() => onNavigate("dailyRecords")}>Günlük kayıtlara git <Icon name="chevronRight" size={14}/></button></div></div></div>;
 }
 
 function DailyRecordsPage({ selectedRecords }) {
@@ -930,6 +1202,11 @@ function DailyRecordsPage({ selectedRecords }) {
   useEffect(() => {
     if (!monthOptions.includes(selectedMonth)) setSelectedMonth(monthOptions[0] || today.slice(0, 7));
   }, [monthOptions, selectedMonth]);
+  const incomeByDate = useMemo(() => {
+    const map = {};
+    buildIncomeEvents(selectedRecords).events.forEach((event) => { map[event.date] = (map[event.date] || 0) + toNumber(event.amount); });
+    return map;
+  }, [selectedRecords]);
   const monthDays = useMemo(() => {
     const [year, month] = selectedMonth.split("-").map(Number);
     const dayCount = new Date(year, month, 0).getDate();
@@ -939,7 +1216,7 @@ function DailyRecordsPage({ selectedRecords }) {
       const sales = selectedRecords.sales.filter((row) => row.date === date);
       const expenses = selectedRecords.expenses.filter((row) => row.date === date);
       const production = selectedRecords.production.filter((row) => row.date === date);
-      const income = sum(sales, "total");
+      const income = incomeByDate[date] || 0;
       const expense = sum(expenses, "amount");
       const productionQty = sum(production, "qty");
       const brokenQty = sum(production, "broken");
@@ -947,7 +1224,7 @@ function DailyRecordsPage({ selectedRecords }) {
       const future = date > today;
       return { date, sales, expenses, production, income, expense, net: income - expense, productionQty, brokenQty, recordCount, future, hasRecords: recordCount > 0 };
     });
-  }, [selectedMonth, selectedRecords]);
+  }, [selectedMonth, selectedRecords, incomeByDate]);
   const monthIncome = monthDays.reduce((sum, day) => sum + day.income, 0);
   const monthExpense = monthDays.reduce((sum, day) => sum + day.expense, 0);
   const activeDays = monthDays.filter((day) => day.hasRecords).length;
@@ -972,11 +1249,11 @@ function DailyRecordsPage({ selectedRecords }) {
   </div>;
 }
 
-function ModuleView({ activeView, records, query, setQuery, onAdd, onEdit, onDelete, onDetail, onPay, onPrint }) {
+function ModuleView({ activeView, records, query, setQuery, onAdd, onEdit, onDelete, onDetail, onPay, onPrint, onCollect, onPrintCustomer }) {
   const copy = viewCopy[activeView];
   const isFinanceView = activeView === "sales" || activeView === "expenses";
   const [filterOpen, setFilterOpen] = useState(false);
-  const [debtFilter, setDebtFilter] = useState("all");
+  const [creditTab, setCreditTab] = useState("sales");
   const [filters, setFilters] = useState({ dateFrom: "", dateTo: "", payment: "", category: "", status: "" });
   const [sortValue, setSortValue] = useState("date:desc");
   const updateFilter = (key) => (event) => setFilters((current) => ({ ...current, [key]: event.target.value }));
@@ -988,11 +1265,13 @@ function ModuleView({ activeView, records, query, setQuery, onAdd, onEdit, onDel
     ? [{ value: "date:desc", label: "Tarih: yeni → eski" }, { value: "date:asc", label: "Tarih: eski → yeni" }, { value: "amount:desc", label: "Tutar: yüksek → düşük" }, { value: "amount:asc", label: "Tutar: düşük → yüksek" }, { value: "qty:desc", label: "Adet: yüksek → düşük" }, { value: "customer:asc", label: "Müşteri: A → Z" }, { value: "product:asc", label: "Malzeme: A → Z" }]
     : activeView === "expenses"
       ? [{ value: "date:desc", label: "Tarih: yeni → eski" }, { value: "date:asc", label: "Tarih: eski → yeni" }, { value: "amount:desc", label: "Tutar: yüksek → düşük" }, { value: "amount:asc", label: "Tutar: düşük → yüksek" }, { value: "category:asc", label: "Kategori: A → Z" }, { value: "description:asc", label: "Açıklama: A → Z" }]
-      : [{ value: "date:desc", label: "Tarih: yeni → eski" }, { value: "date:asc", label: "Tarih: eski → yeni" }, { value: "amount:desc", label: "Değer: yüksek → düşük" }, { value: "amount:asc", label: "Değer: düşük → yüksek" }];
+      : activeView === "creditSales"
+        ? [{ value: "date:desc", label: "Tarih: yeni → eski" }, { value: "date:asc", label: "Tarih: eski → yeni" }, { value: "amount:desc", label: "Kalan: yüksek → düşük" }, { value: "amount:asc", label: "Kalan: düşük → yüksek" }, { value: "customer:asc", label: "Müşteri: A → Z" }, { value: "product:asc", label: "Ürün: A → Z" }]
+        : [{ value: "date:desc", label: "Tarih: yeni → eski" }, { value: "date:asc", label: "Tarih: eski → yeni" }, { value: "amount:desc", label: "Değer: yüksek → düşük" }, { value: "amount:asc", label: "Değer: düşük → yüksek" }];
   const [sortKey, sortDirection] = sortValue.split(":");
   const getSortValue = (row) => {
     if (sortKey === "date") return row.date || "";
-    if (sortKey === "amount") return activeView === "debts" ? debtAmounts(row).remaining : toNumber(row.total ?? row.amount ?? row.qty ?? row.salary ?? row.stock ?? 0);
+    if (sortKey === "amount") return activeView === "debts" ? debtAmounts(row).remaining : activeView === "creditSales" ? creditAmounts(row).remaining : toNumber(row.total ?? row.amount ?? row.qty ?? row.salary ?? row.stock ?? 0);
     if (sortKey === "qty") return toNumber(row.qty);
     if (sortKey === "customer") return row.customer || "";
     if (sortKey === "product") return row.product || "";
@@ -1008,8 +1287,7 @@ function ModuleView({ activeView, records, query, setQuery, onAdd, onEdit, onDel
     const matchesPayment = !filters.payment || row.payment === filters.payment;
     const matchesCategory = !filters.category || row.category === filters.category;
     const matchesStatus = !filters.status || row.status === filters.status;
-    const matchesDirection = activeView !== "debts" || debtFilter === "all" || debtDirection(row) === debtFilter;
-    return matchesSearch && matchesDate && matchesPayment && matchesCategory && matchesStatus && matchesDirection;
+    return matchesSearch && matchesDate && matchesPayment && matchesCategory && matchesStatus;
   });
   const sortedRows = [...visibleRows].sort((left, right) => {
     const leftValue = getSortValue(left);
@@ -1019,19 +1297,22 @@ function ModuleView({ activeView, records, query, setQuery, onAdd, onEdit, onDel
       : String(leftValue).localeCompare(String(rightValue), "tr-TR", { numeric: true, sensitivity: "base" });
     return sortDirection === "desc" ? -comparison : comparison;
   });
-  const total = visibleRows.reduce((sum, row) => sum + (activeView === "debts" ? debtAmounts(row).remaining : toNumber(row.total ?? row.amount ?? row.qty ?? 0)), 0);
+  const rowOpenValue = (row) => activeView === "debts" ? debtAmounts(row).remaining : activeView === "creditSales" ? creditAmounts(row).remaining : toNumber(row.total ?? row.amount ?? row.qty ?? 0);
+  const total = visibleRows.reduce((sum, row) => sum + rowOpenValue(row), 0);
   const broken = visibleRows.reduce((sum, row) => sum + toNumber(row.broken ?? 0), 0);
   const cement = visibleRows.reduce((sum, row) => sum + toNumber(row.cement ?? 0), 0);
   const salary = visibleRows.reduce((sum, row) => sum + toNumber(row.salary ?? 0), 0);
   const balance = visibleRows.reduce((sum, row) => sum + toNumber(row.balance ?? 0), 0);
-  const owedOpen = activeView === "debts" ? visibleRows.filter((row) => debtDirection(row) !== "lent").reduce((sum, row) => sum + debtAmounts(row).remaining, 0) : 0;
-  const lentOpen = activeView === "debts" ? visibleRows.filter((row) => debtDirection(row) === "lent").reduce((sum, row) => sum + debtAmounts(row).remaining, 0) : 0;
-  const owedCount = activeView === "debts" ? records.filter((row) => debtDirection(row) !== "lent").length : 0;
-  const lentCount = activeView === "debts" ? records.filter((row) => debtDirection(row) === "lent").length : 0;
+  const owedOpen = activeView === "debts" ? visibleRows.reduce((sum, row) => sum + debtAmounts(row).remaining, 0) : 0;
+  const debtPaid = activeView === "debts" ? visibleRows.reduce((sum, row) => sum + debtAmounts(row).paid, 0) : 0;
+  const creditOpen = activeView === "creditSales" ? visibleRows.reduce((sum, row) => sum + creditAmounts(row).remaining, 0) : 0;
+  const creditPaid = activeView === "creditSales" ? visibleRows.reduce((sum, row) => sum + creditAmounts(row).paid, 0) : 0;
+  const creditCustomerCount = activeView === "creditSales" ? groupCreditSalesByCustomer(visibleRows).length : 0;
+  const creditCustomerTotal = activeView === "creditSales" ? groupCreditSalesByCustomer(records).length : 0;
   const activeFilterCount = Object.values(filters).filter(Boolean).length;
   const stockMoveDates = activeView === "stock" ? visibleRows.map((row) => row.date).filter(Boolean).sort() : [];
   const lastStockMove = stockMoveDates.length ? dateLabel(stockMoveDates[stockMoveDates.length - 1]) : "Yok";
-  const stats = activeView === "sales" ? [{ label: "Toplam satış", value: amount(total) }, { label: "Kayıt sayısı", value: visibleRows.length }, { label: "Ortalama satış", value: visibleRows.length ? amount(total / visibleRows.length) : amount(0) }] : activeView === "expenses" ? [{ label: "Toplam gider", value: amount(total) }, { label: "Kayıt sayısı", value: visibleRows.length }, { label: "Bekleyen inceleme", value: visibleRows.filter((row) => row.status === "İnceleniyor").length }] : activeView === "production" ? [{ label: "Toplam adet", value: money(total) }, { label: "Fire adedi", value: money(broken) }, { label: "Hammadde kullanımı", value: money(cement) }] : activeView === "stock" ? [{ label: "Toplam kalem", value: visibleRows.length }, { label: "Düşük stok", value: visibleRows.filter((row) => row.state === "Düşük").length }, { label: "Son hareket", value: lastStockMove }] : activeView === "matExpenses" ? [{ label: "Toplam tutar", value: amount(total) }, { label: "Kayıt sayısı", value: visibleRows.length }, { label: "Ürün çeşidi", value: new Set(visibleRows.map((row) => row.product).filter(Boolean)).size }] : activeView === "workers" ? [{ label: "Çalışan", value: visibleRows.length }, { label: "Maaş toplamı", value: amount(salary) }, { label: "Bakiye", value: amount(balance) }] : [{ label: "Alınan açık", value: amount(owedOpen) }, { label: "Verilen açık", value: amount(lentOpen) }, { label: "Kayıt sayısı", value: visibleRows.length }];
+  const stats = activeView === "sales" ? [{ label: "Toplam satış", value: amount(total) }, { label: "Kayıt sayısı", value: visibleRows.length }, { label: "Ortalama satış", value: visibleRows.length ? amount(total / visibleRows.length) : amount(0) }] : activeView === "expenses" ? [{ label: "Toplam gider", value: amount(total) }, { label: "Kayıt sayısı", value: visibleRows.length }, { label: "Bekleyen inceleme", value: visibleRows.filter((row) => row.status === "İnceleniyor").length }] : activeView === "production" ? [{ label: "Toplam adet", value: money(total) }, { label: "Fire adedi", value: money(broken) }, { label: "Hammadde kullanımı", value: money(cement) }] : activeView === "stock" ? [{ label: "Toplam kalem", value: visibleRows.length }, { label: "Düşük stok", value: visibleRows.filter((row) => row.state === "Düşük").length }, { label: "Son hareket", value: lastStockMove }] : activeView === "matExpenses" ? [{ label: "Toplam tutar", value: amount(total) }, { label: "Kayıt sayısı", value: visibleRows.length }, { label: "Ürün çeşidi", value: new Set(visibleRows.map((row) => row.product).filter(Boolean)).size }] : activeView === "workers" ? [{ label: "Çalışan", value: visibleRows.length }, { label: "Maaş toplamı", value: amount(salary) }, { label: "Bakiye", value: amount(balance) }] : activeView === "creditSales" ? [{ label: "Bekleyen tahsilat", value: amount(creditOpen) }, { label: "Tahsil edilen", value: amount(creditPaid) }, { label: "Müşteri", value: creditCustomerCount }] : [{ label: "Açık borç", value: amount(owedOpen) }, { label: "Ödenen", value: amount(debtPaid) }, { label: "Kayıt sayısı", value: visibleRows.length }];
   return <div className="module-page">
     <div className="module-summary">{stats.map((stat) => <div className="module-stat" key={stat.label}><span>{stat.label}</span><strong>{stat.value}</strong></div>)}</div>
     <section className="panel module-panel">
@@ -1052,8 +1333,8 @@ function ModuleView({ activeView, records, query, setQuery, onAdd, onEdit, onDel
         <button type="button" className="text-button filter-clear" onClick={clearFilters}>Filtreleri temizle</button>
       </div>}
       <div className="module-result-meta"><span>{visibleRows.length} kayıt gösteriliyor</span>{(query || activeFilterCount) && <span>Toplam {records.length} kayıttan süzüldü</span>}</div>
-      {activeView === "debts" && <div className="debt-tabs" role="tablist" aria-label="Borç türü filtresi"><button type="button" role="tab" aria-selected={debtFilter === "all"} className={`debt-tab ${debtFilter === "all" ? "active" : ""}`} onClick={() => setDebtFilter("all")}>Tümü <span className="count">({records.length})</span></button><button type="button" role="tab" aria-selected={debtFilter === "owed"} className={`debt-tab ${debtFilter === "owed" ? "active" : ""}`} onClick={() => setDebtFilter("owed")}>Alınan borç <span className="count">({owedCount})</span></button><button type="button" role="tab" aria-selected={debtFilter === "lent"} className={`debt-tab ${debtFilter === "lent" ? "active" : ""}`} onClick={() => setDebtFilter("lent")}>Verilen borç <span className="count">({lentCount})</span></button></div>}
-      <ModuleTable kind={activeView} rows={sortedRows} onEdit={onEdit} onDelete={onDelete} onDetail={onDetail} onPay={onPay} onPrint={onPrint}/>
+      {activeView === "creditSales" && <div className="debt-tabs" role="tablist" aria-label="Vadeli satış görünümü"><button type="button" role="tab" aria-selected={creditTab === "sales"} className={`debt-tab ${creditTab === "sales" ? "active" : ""}`} onClick={() => setCreditTab("sales")}>Satışlar <span className="count">({records.length})</span></button><button type="button" role="tab" aria-selected={creditTab === "customers"} className={`debt-tab ${creditTab === "customers" ? "active" : ""}`} onClick={() => setCreditTab("customers")}>Müşteriler <span className="count">({creditCustomerTotal})</span></button></div>}
+      {activeView === "creditSales" && creditTab === "customers" ? <CustomerGroups groups={groupCreditSalesByCustomer(visibleRows)} onCollect={onCollect} onPay={onPay} onDetail={onDetail} onPrint={onPrint} onPrintCustomer={onPrintCustomer}/> : <ModuleTable kind={activeView} rows={sortedRows} onEdit={onEdit} onDelete={onDelete} onDetail={onDetail} onPay={onPay} onPrint={onPrint}/>}
     </section>
   </div>;
 }
@@ -1088,8 +1369,43 @@ function DebtTable({ rows, onEdit, onDelete, onDetail, onPay, onPrint }) {
   })}</tbody></table></div>;
 }
 
+function CreditSalesTable({ rows, onEdit, onDelete, onDetail, onPay, onPrint }) {
+  if (!rows.length) return <div className="empty-module-state"><span className="empty-icon"><Icon name="briefcase" size={19}/></span><strong>Vadeli satış için henüz kayıt yok</strong><span>İlk kaydı eklediğinizde bu bölümde görünecek.</span></div>;
+  return <div className="table-wrap module-table"><table><thead><tr><th>MÜŞTERİ</th><th>ÜRÜN</th><th>VADE</th><th className="align-right">TOPLAM</th><th className="align-right">TAHSİL</th><th className="align-right">KALAN</th><th>DURUM</th><th></th></tr></thead><tbody>{rows.map((row) => {
+    const sale = normalizeCreditSale(row);
+    const amounts = creditAmounts(sale);
+    const status = creditStatusLabel(sale);
+    const tone = amounts.remaining <= 0 && amounts.total > 0 ? "success" : amounts.paid > 0 ? "warning" : "danger";
+    const dueIsDate = /^\d{4}-\d{2}-\d{2}$/.test(sale.due || "");
+    const dueOverdue = dueIsDate && sale.due < today && amounts.remaining > 0;
+    const qty = toNumber(sale.qty);
+    return <tr key={sale.id}><td><div className="person-cell"><span className="row-avatar">{(sale.customer || "?").slice(0, 1)}</span><span className="debt-person"><strong>{sale.customer}</strong><small>{dateLabel(sale.date)}{sale.invoice ? ` · ${sale.invoice}` : ""}</small></span></div></td><td><strong>{sale.product}</strong>{qty > 0 && <small className="cell-sub">{money(qty)} adet</small>}</td><td>{dueIsDate ? dateLabel(sale.due) : sale.due}{dueOverdue && <> <Badge tone="danger">Gecikti</Badge></>}</td><td className="align-right amount">{amount(amounts.total)}</td><td className="align-right">{amount(amounts.paid)}</td><td className="align-right amount">{amount(amounts.remaining)}</td><td><div className="payment-cell"><Badge tone={tone}>{status}</Badge><DebtProgress row={creditToDebtLike(sale)}/></div></td><td className="record-actions">{amounts.remaining > 0 && onPay && <button className="button primary small" onClick={() => onPay(sale)}>Tahsilat</button>}{onDetail && <button className="row-action" onClick={() => onDetail(sale)} aria-label="İşlem detayı" title="İşlem detayı"><Icon name="receipt" size={15}/></button>}{onPrint && <button className="row-action" onClick={() => onPrint(sale)} aria-label="Fiş yazdır" title="Fiş yazdır (PDF)"><Icon name="download" size={15}/></button>}<button className="row-action" onClick={() => onEdit(sale)} aria-label="Düzenle"><Icon name="edit" size={15}/></button><button className="row-action danger-action" onClick={() => onDelete(sale)} aria-label="Sil"><Icon name="trash" size={15}/></button></td></tr>;
+  })}</tbody></table></div>;
+}
+
+function CustomerGroups({ groups, onCollect, onPay, onDetail, onPrint, onPrintCustomer }) {
+  const [openKey, setOpenKey] = useState(null);
+  if (!groups.length) return <div className="empty-module-state"><span className="empty-icon"><Icon name="users" size={19}/></span><strong>Gösterilecek müşteri yok</strong><span>Arama kriterine uyan vadeli satış bulunamadı.</span></div>;
+  return <div className="customer-groups">{groups.map((group) => {
+    const expanded = openKey === group.key;
+    return <div className="worker-month" key={group.key}>
+      <button type="button" className="worker-month-head" onClick={() => setOpenKey(expanded ? null : group.key)} aria-expanded={expanded}><strong>{group.name}</strong><span>{amount(group.remaining)} kalan · {group.sales.length} satış <Icon name="chevron" size={14}/></span></button>
+      {expanded && <div>
+        <div className="worker-day"><div><span>Toplam {amount(group.total)} · Tahsil {amount(group.paid)}</span><small>{group.openCount} açık satış</small></div><div className="customer-sale-actions">{onPrintCustomer && <button type="button" className="button secondary small" onClick={() => onPrintCustomer(group.name)}><Icon name="download" size={14}/> Fiş yazdır</button>}{group.remaining > 0 && onCollect && <button type="button" className="button primary small" onClick={() => onCollect(group.name)}>Tahsilat al</button>}</div></div>
+        {group.sales.map((sale) => {
+          const amounts = creditAmounts(sale);
+          const dueIsDate = /^\d{4}-\d{2}-\d{2}$/.test(sale.due || "");
+          const dueOverdue = dueIsDate && sale.due < today && amounts.remaining > 0;
+          return <div className="worker-day" key={sale.id}><div><span>{dateLabel(sale.date)} · {creditProductLabel(sale)}</span><small>Toplam {amount(amounts.total)} · Tahsil {amount(amounts.paid)} · Vade {dueIsDate ? dateLabel(sale.due) : sale.due}{dueOverdue ? " · Gecikti" : ""} · {creditStatusLabel(sale)}</small></div><div className="customer-sale-side"><strong>{amount(amounts.remaining)} kalan</strong><div className="customer-sale-actions">{amounts.remaining > 0 && onPay && <button type="button" className="button primary small" onClick={() => onPay(sale)}>Tahsilat</button>}{onDetail && <button type="button" className="row-action" onClick={() => onDetail(sale)} aria-label="İşlem detayı" title="İşlem detayı"><Icon name="receipt" size={15}/></button>}{onPrint && <button type="button" className="row-action" onClick={() => onPrint(sale)} aria-label="Fiş yazdır" title="Fiş yazdır (PDF)"><Icon name="download" size={15}/></button>}</div></div></div>;
+        })}
+      </div>}
+    </div>;
+  })}</div>;
+}
+
 function ModuleTable({ kind, rows, onEdit, onDelete, onDetail, onPay, onPrint }) {
   if (kind === "debts") return <DebtTable rows={rows} onEdit={onEdit} onDelete={onDelete} onDetail={onDetail} onPay={onPay} onPrint={onPrint}/>;
+  if (kind === "creditSales") return <CreditSalesTable rows={rows} onEdit={onEdit} onDelete={onDelete} onDetail={onDetail} onPay={onPay} onPrint={onPrint}/>;
   if (!rows.length) return <div className="empty-module-state"><span className="empty-icon"><Icon name={viewCopy[kind].icon} size={19}/></span><strong>{viewCopy[kind].title} için henüz kayıt yok</strong><span>İlk kaydı eklediğinizde bu bölümde görünecek.</span></div>;
   if (kind === "sales") return <div className="table-wrap module-table"><table><thead><tr><th>TARİH</th><th>MÜŞTERİ</th><th>MALZEME</th><th>ADET</th><th>ÖDEME</th><th className="align-right">TUTAR</th><th>FATURA</th><th></th></tr></thead><tbody>{rows.map((row) => <tr key={row.id}><td>{dateLabel(row.date)}</td><td><div className="person-cell"><span className="row-avatar">{(row.customer || "?").slice(0, 1)}</span><strong>{row.customer}</strong></div></td><td>{row.product}</td><td>{money(row.qty)}</td><td><PaymentCell row={row}/></td><td className="align-right amount">{amount(row.total)}</td><td>{row.invoice}</td><RecordActions row={row} onEdit={onEdit} onDelete={onDelete}/></tr>)}</tbody></table></div>;
   if (kind === "expenses") return <div className="table-wrap module-table"><table><thead><tr><th>TARİH</th><th>KATEGORİ</th><th>AÇIKLAMA</th><th>ÖDEME</th><th className="align-right">TUTAR</th><th>DURUM</th><th></th></tr></thead><tbody>{rows.map((row) => <tr key={row.id}><td>{dateLabel(row.date)}</td><td><div className="category-cell"><span className="category-icon"><Icon name={row.category === "Transport" ? "truck" : row.category === "Yakıt" ? "factory" : "receipt"} size={15}/></span>{row.category}</div></td><td><div>{row.detail}</div>{row.worker ? <small className="cell-sub">Çalışan: {row.worker}</small> : null}{row.note ? <small className="cell-sub">{row.note}</small> : null}</td><td><PaymentCell row={row}/></td><td className="align-right amount">{amount(row.amount)}</td><td><Badge tone={row.status === "İnceleniyor" ? "warning" : row.status === "Taslak" ? "neutral" : "success"}>{row.status}</Badge></td><RecordActions row={row} onEdit={onEdit} onDelete={onDelete}/></tr>)}</tbody></table></div>;
@@ -1147,7 +1463,7 @@ function WorkerDetailModal({ worker, expenses, onClose }) {
   </Modal>;
 }
 
-function DebtPaymentModal({ debt, onClose, onSave }) {
+function DebtPaymentModal({ debt, paymentMethods = [], enablePayment = false, onClose, onSave }) {
   const row = normalizeDebtRow(debt || {});
   const lent = debtDirection(row) === "lent";
   const { total, paid, remaining } = debtAmounts(row);
@@ -1155,8 +1471,10 @@ function DebtPaymentModal({ debt, onClose, onSave }) {
   const [payAmount, setPayAmount] = useState("");
   const [remainingAfter, setRemainingAfter] = useState("");
   const [note, setNote] = useState("");
+  const [method, setMethod] = useState(paymentMethods[0] || "");
   const [error, setError] = useState("");
-  if (!debt) return null;
+  const methodOptions = paymentMethods.includes(method) || !method ? paymentMethods : [method, ...paymentMethods];
+  if (!debt?.id) return null;
   const payLabel = lent ? "Tahsil edilen" : "Ödenen";
   const onPayChange = (value) => {
     setPayAmount(value);
@@ -1174,13 +1492,14 @@ function DebtPaymentModal({ debt, onClose, onSave }) {
     const value = toNumber(payAmount);
     if (!(value > 0)) { setError("Tutar sıfırdan büyük olmalıdır."); return; }
     if (value - remaining > 1e-9) { setError("Tutar kalan tutardan büyük olamaz."); return; }
-    onSave(row.id, { amount: value, date: date || today, note });
+    onSave(row.id, { amount: value, date: date || today, note, payment: enablePayment ? method : "" });
   };
   return <Modal title={lent ? "Tahsilat yap" : "Borç öde"} onClose={onClose} wide>
     <form className="modal-form" onSubmit={submit}>
       <div className="pay-summary"><div><span>Kişi</span><strong>{row.creditor}</strong></div><div><span>Toplam</span><strong>{amount(total)}</strong></div><div><span>{lent ? "Tahsil edilen" : "Ödenen"}</span><strong>{amount(paid)}</strong></div><div><span>Kalan</span><strong className="negative">{amount(remaining)}</strong></div></div>
       <div className="form-grid two">
         <label>İşlem tarihi<input type="date" value={date} onChange={(event) => setDate(event.target.value)}/></label>
+        {enablePayment && <label>Ödeme tipi<select value={method} onChange={(event) => setMethod(event.target.value)}>{methodOptions.map((item) => <option key={item} value={item}>{item}</option>)}</select></label>}
         <label>Açıklama (opsiyonel)<input value={note} onChange={(event) => setNote(event.target.value)} placeholder="Ödeme açıklaması"/></label>
         <label>{payLabel}<input required type="number" min="0" step="any" value={payAmount} onChange={(event) => onPayChange(event.target.value)} placeholder="0,00"/><small className="field-hint">Bu işlemde işlenecek tutar.</small></label>
         <label>Kalan (işlem sonrası)<input type="number" min="0" step="any" value={remainingAfter} onChange={(event) => onRemainingChange(event.target.value)} placeholder="0,00"/><small className="field-hint">Kalanı yazarsanız tutar otomatik hesaplanır.</small></label>
@@ -1208,6 +1527,76 @@ function DebtDetailModal({ debt, onClose, onPay, onPrint }) {
   </Modal>;
 }
 
+function CreditDetailModal({ sale, onClose, onPay, onPrint }) {
+  const row = sale ? normalizeCreditSale(sale) : null;
+  if (!row) return null;
+  const { total, down, collected, paid, remaining } = creditAmounts(row);
+  const dueIsDate = /^\d{4}-\d{2}-\d{2}$/.test(row.due || "");
+  const dueOverdue = dueIsDate && row.due < today && remaining > 0;
+  const txns = [...(down > 0 ? [{ id: `${row.id}-downpayment`, date: row.date, amount: down, note: "Peşinat" }] : []), ...row.transactions].sort((left, right) => String(right.date).localeCompare(String(left.date)));
+  return <Modal title={`${row.customer || "Müşteri"} · işlem detayı`} onClose={onClose} wide>
+    <div className="worker-detail-body">
+      <div className="debt-detail-head"><Badge tone="teal">Vadeli satış</Badge><Badge tone={remaining <= 0 && total > 0 ? "success" : paid > 0 ? "warning" : "danger"}>{creditStatusLabel(row)}</Badge></div>
+      <div className="worker-day"><div><span>{creditProductLabel(row)}</span><small>{fullDateLabel(row.date)} · Vade {dueIsDate ? fullDateLabel(row.due) : row.due}{dueOverdue ? " · Gecikti" : ""}</small></div><strong>{amount(total)}</strong></div>
+      <div className="pay-summary"><div><span>Toplam</span><strong>{amount(total)}</strong></div><div><span>Peşinat</span><strong>{amount(down)}</strong></div><div><span>Tahsilatlar</span><strong>{amount(collected)}</strong></div><div><span>Kalan</span><strong className={remaining > 0 ? "negative" : "positive"}>{amount(remaining)}</strong></div></div>
+      <DebtProgress row={creditToDebtLike(row)}/>
+      {txns.length ? <div className="txn-list">{txns.map((txn) => <div className="txn-row" key={txn.id}><span className="txn-date">{fullDateLabel(txn.date)}</span><span className="txn-note">{txn.note || <span className="muted-text">Açıklama yok</span>}</span><strong className="txn-amount">{amount(txn.amount)}</strong></div>)}</div> : <div className="empty-table-state"><span className="empty-icon"><Icon name="receipt" size={19}/></span><strong>Henüz tahsilat yok</strong><span>Tahsilat tuşuyla ilk tahsilatı ekleyin.</span></div>}
+      <div className="modal-actions">{onPrint && <button type="button" className="button secondary" onClick={() => onPrint(row)}><Icon name="download" size={16}/> Fiş yazdır</button>}<button type="button" className="button secondary" onClick={onClose}>Kapat</button>{remaining > 0 && <button type="button" className="button primary" onClick={() => onPay(row)}><Icon name="check" size={16}/> Tahsilat yap</button>}</div>
+    </div>
+  </Modal>;
+}
+
+function CustomerCollectionModal({ customer, sales, paymentMethods, onClose, onSave }) {
+  const openSales = (sales || []).map(normalizeCreditSale).filter((sale) => creditAmounts(sale).remaining > 0).sort((left, right) => String(left.date).localeCompare(String(right.date)));
+  const totalRemaining = openSales.reduce((sum, sale) => sum + creditAmounts(sale).remaining, 0);
+  const [date, setDate] = useState(today);
+  const [note, setNote] = useState("");
+  const [method, setMethod] = useState(paymentMethods[0] || "");
+  const [totalPay, setTotalPay] = useState("");
+  const [alloc, setAlloc] = useState({});
+  const [error, setError] = useState("");
+  const methodOptions = paymentMethods.includes(method) || !method ? paymentMethods : [method, ...paymentMethods];
+  if (!openSales.length) return null;
+  const distribute = (value) => {
+    let rest = Math.max(0, toNumber(value));
+    const next = {};
+    openSales.forEach((sale) => {
+      const share = Math.min(creditAmounts(sale).remaining, rest);
+      rest = Math.max(0, rest - share);
+      next[sale.id] = share > 0 ? String(Math.round(share * 100) / 100) : "";
+    });
+    setAlloc(next);
+  };
+  const onTotalChange = (value) => { setTotalPay(value); setError(""); distribute(value); };
+  const distributed = openSales.reduce((sum, sale) => sum + Math.max(0, toNumber(alloc[sale.id] || 0)), 0);
+  const submit = (event) => {
+    event.preventDefault();
+    const total = toNumber(totalPay);
+    if (!(total > 0)) { setError("Tutar sıfırdan büyük olmalıdır."); return; }
+    if (total - totalRemaining > 1e-9) { setError("Tutar toplam kalandan büyük olamaz."); return; }
+    for (const sale of openSales) {
+      const share = toNumber(alloc[sale.id] || 0);
+      if (share < -1e-9 || share - creditAmounts(sale).remaining > 1e-9) { setError(`${creditProductLabel(sale)} için tutar kalanı aşamaz.`); return; }
+    }
+    if (Math.abs(distributed - total) > 1e-9) { setError("Dağıtım toplamı tahsilat tutarına eşit olmalıdır."); return; }
+    onSave(openSales.map((sale) => ({ saleId: sale.id, amount: Math.max(0, toNumber(alloc[sale.id] || 0)) })).filter((item) => item.amount > 0), { date: date || today, note, payment: method });
+  };
+  return <Modal title={`${customer} · toplu tahsilat`} onClose={onClose} wide>
+    <form className="modal-form" onSubmit={submit}>
+      <div className="pay-summary"><div><span>Açık satış</span><strong>{openSales.length}</strong></div><div><span>Toplam kalan</span><strong className="negative">{amount(totalRemaining)}</strong></div><div><span>Dağıtılan</span><strong>{amount(distributed)}</strong></div><div><span>Artan</span><strong>{amount(Math.max(0, toNumber(totalPay) - distributed))}</strong></div></div>
+      <div className="form-grid two">
+        <label>İşlem tarihi<input type="date" value={date} onChange={(event) => setDate(event.target.value)}/></label>
+        <label>Ödeme tipi<select value={method} onChange={(event) => setMethod(event.target.value)}>{methodOptions.map((item) => <option key={item} value={item}>{item}</option>)}</select></label>
+        <label>Tahsil edilen toplam<input required type="number" min="0" step="any" value={totalPay} onChange={(event) => onTotalChange(event.target.value)} placeholder="0,00"/><small className="field-hint">Tutar en eski satıştan başlayarak otomatik dağıtılır; satırları elle düzeltebilirsiniz.</small></label>
+        <label>Açıklama (opsiyonel)<input value={note} onChange={(event) => setNote(event.target.value)} placeholder="Tahsilat açıklaması"/></label>
+      </div>
+      <div className="txn-list">{openSales.map((sale) => <div className="txn-row alloc-row" key={sale.id}><span className="txn-date">{dateLabel(sale.date)}</span><span className="txn-note">{creditProductLabel(sale)}</span><input type="number" min="0" step="any" aria-label={`${creditProductLabel(sale)} tahsilat tutarı`} value={alloc[sale.id] || ""} onChange={(event) => { setAlloc((current) => ({ ...current, [sale.id]: event.target.value })); setError(""); }} placeholder="0,00"/><strong className="txn-amount">Kalan {amount(creditAmounts(sale).remaining)}</strong></div>)}</div>
+      {error && <div className="form-error" role="alert">{error}</div>}
+      <div className="modal-actions"><button type="button" className="button secondary" onClick={() => distribute(totalPay)}>FIFO dağıt</button><button className="button primary" type="submit"><Icon name="check" size={16}/> Tahsilatı kaydet</button></div>
+    </form>
+  </Modal>;
+}
+
 function SettingsModal({ companyName, paymentMethods, colors, materials, stockAutomationEnabled, onToggleStockAutomation, onAddPayment, onRemovePayment, onAddColor, onRemoveColor, onAddMaterial, onRemoveMaterial, onExport, onImport, onSignOut, onClose }) {
   const [newPayment, setNewPayment] = useState("");
   const [newColor, setNewColor] = useState("");
@@ -1215,7 +1604,7 @@ function SettingsModal({ companyName, paymentMethods, colors, materials, stockAu
   const [newUnit, setNewUnit] = useState("adet");
   return <Modal title="Muhasebe ayarları" onClose={onClose} wide><div className="settings-body">
     <section className="settings-section permission-section"><div className="settings-icon"><Icon name="shield" size={19}/></div><div><div className="panel-kicker">YETKİ PROFİLİ</div><h4>Muhasebe · tam yetki</h4><p>Günlük kayıtlar, ödeme yöntemleri, stoklar ve veri yedekleri üzerinde tüm işlemler açık.</p></div></section>
-    <section className="settings-section"><div className="stock-automation-row"><div><div className="panel-kicker">SATIŞ → STOK</div><h4>Satışta otomatik stok düşümü</h4><p>Açıkken seçilen ürünün satış adedi, satış kaydı oluşturulunca ilgili stoktan düşer. Kapalıyken satış kaydı stok miktarını değiştirmez.</p></div><button type="button" className={`switch-control ${stockAutomationEnabled ? "on" : ""}`} role="switch" aria-checked={stockAutomationEnabled} aria-label="Satışta otomatik stok düşümünü aç veya kapat" onClick={() => onToggleStockAutomation(!stockAutomationEnabled)}><span/></button></div><div className="stock-automation-status"><Badge tone={stockAutomationEnabled ? "success" : "neutral"}>{stockAutomationEnabled ? "Açık" : "Kapalı"}</Badge><span>{stockAutomationEnabled ? "Yeni satışlar stoktan düşer." : "Stok hareketleri manuel kalır."}</span></div></section>
+    <section className="settings-section"><div className="stock-automation-row"><div><div className="panel-kicker">SATIŞ → STOK</div><h4>Satışta otomatik stok düşümü</h4><p>Açıkken seçilen ürünün satış adedi, peşin veya vadeli satış kaydı oluşturulunca ilgili stoktan düşer. Kapalıyken satış kaydı stok miktarını değiştirmez.</p></div><button type="button" className={`switch-control ${stockAutomationEnabled ? "on" : ""}`} role="switch" aria-checked={stockAutomationEnabled} aria-label="Satışta otomatik stok düşümünü aç veya kapat" onClick={() => onToggleStockAutomation(!stockAutomationEnabled)}><span/></button></div><div className="stock-automation-status"><Badge tone={stockAutomationEnabled ? "success" : "neutral"}>{stockAutomationEnabled ? "Açık" : "Kapalı"}</Badge><span>{stockAutomationEnabled ? "Yeni satışlar stoktan düşer." : "Stok hareketleri manuel kalır."}</span></div></section>
     <section className="settings-section"><div className="settings-section-head"><div><div className="panel-kicker">İŞLETME</div><h4>{companyName}</h4><p>Bu panel tek işletme için çalışır: AYES GROUP.</p></div></div></section>
     <section className="settings-section"><div className="settings-section-head"><div><div className="panel-kicker">ÖDEME YÖNTEMLERİ</div><h4>Ödeme seçenekleri</h4><p>Satış ve gider kayıtlarında kullanılacak yöntemleri yönetin.</p></div></div><form className="settings-inline-form" onSubmit={(event) => { event.preventDefault(); if (newPayment.trim()) { onAddPayment(newPayment); setNewPayment(""); } }}><input aria-label="Yeni ödeme yöntemi" value={newPayment} onChange={(event) => setNewPayment(event.target.value)} placeholder="Yeni ödeme yöntemi"/><button className="button primary small" type="submit"><Icon name="plus" size={14}/> Ekle</button></form><div className="settings-list">{paymentMethods.map((method) => <div className="settings-list-row" key={method}><span>{method}</span><button className="menu-icon-button danger" aria-label={`${method} ödeme yöntemini sil`} onClick={() => onRemovePayment(method)}><Icon name="trash" size={14}/></button></div>)}</div></section>
     <section className="settings-section"><div className="settings-section-head"><div><div className="panel-kicker">RENK SEÇENEKLERİ</div><h4>Renk listesi</h4><p>Renkler yalnızca buradan eklenir; stok ve malzeme gideri kayıtlarında bu liste kullanılır.</p></div></div><form className="settings-inline-form" onSubmit={(event) => { event.preventDefault(); if (newColor.trim()) { onAddColor(newColor); setNewColor(""); } }}><input aria-label="Yeni renk" value={newColor} onChange={(event) => setNewColor(event.target.value)} placeholder="Yeni renk adı"/><button className="button primary small" type="submit"><Icon name="plus" size={14}/> Ekle</button></form><div className="settings-list">{colors.map((color) => <div className="settings-list-row" key={color}><span>{color}</span><button className="menu-icon-button danger" aria-label={`${color} rengini sil`} onClick={() => onRemoveColor(color)}><Icon name="trash" size={14}/></button></div>)}</div></section>
@@ -1265,7 +1654,7 @@ function PaymentSplitFields({ isSplit, form, update }) {
   </div>;
 }
 
-function EntryModal({ kind: initialKind, edit, date, onClose, onSave, paymentMethods, materials, colors = [], workers = [] }) {
+function EntryModal({ kind: initialKind, edit, date, onClose, onSave, paymentMethods, materials, colors = [], workers = [], customers = [] }) {
   const findMaterial = (name) => materials.find((material) => material.name.toLocaleLowerCase("tr-TR") === String(name || "").toLocaleLowerCase("tr-TR"));
   const materialState = (name) => { const match = findMaterial(name); return { materialId: match?.id || "__new__", materialMode: match ? "existing" : "new", materialName: match?.name || name || "", saveMaterial: false }; };
   const initialForm = () => {
@@ -1279,12 +1668,15 @@ function EntryModal({ kind: initialKind, edit, date, onClose, onSave, paymentMet
       if (initialKind === "matExpenses") return { kind: initialKind, id: edit.id, date: edit.date, color: edit.color || "", package: edit.package || "", length: edit.length || "", unitPrice: edit.unitPrice ?? "", amount: edit.total ?? "", ...materialState(edit.product) };
       if (initialKind === "workers") return { kind: initialKind, id: edit.id, name: edit.name, salary: edit.salary, advance: edit.advance, absence: edit.absence };
       if (initialKind === "debts") {
-        return { kind: initialKind, id: edit.id, date: edit.date, direction: debtDirection(edit), name: edit.creditor, description: edit.source, amount: toNumber(edit.amount), due: edit.due, status: edit.status };
+        return { kind: initialKind, id: edit.id, date: edit.date, name: edit.creditor, description: edit.source, amount: toNumber(edit.amount), due: edit.due, status: edit.status };
+      }
+      if (initialKind === "creditSales") {
+        return { kind: initialKind, id: edit.id, date: edit.date, name: edit.customer, qty: edit.qty ?? "", amount: edit.total ?? "", downPayment: edit.downPayment ?? "", payment: edit.payment, invoice: edit.invoice, due: edit.due, ...materialState(edit.product) };
       }
       return { kind: initialKind, id: edit.id, name: edit.creditor, description: edit.source, amount: edit.amount, due: edit.due, status: edit.status };
     }
     const firstPayment = paymentMethods[0] || "";
-    return { kind: initialKind, date, direction: "owed", name: "", description: "", category: "", note: "", color: "", package: "", length: "", unitPrice: "", amount: "", amountSource: "manual", qty: "", payment: firstPayment, cashAmount: "", mpesaAmount: "", invoice: "", unit: "adet", pallets: "", broken: "", cement: "", remaining: "", salary: "", advance: "", absence: "", due: "Açık", status: "Yeni", workerId: "", worker: "", ...materialState("") };
+    return { kind: initialKind, date, direction: "owed", name: "", description: "", category: "", note: "", color: "", package: "", length: "", unitPrice: "", amount: "", downPayment: "", amountSource: "manual", qty: "", payment: firstPayment, cashAmount: "", mpesaAmount: "", invoice: "", unit: "adet", pallets: "", broken: "", cement: "", remaining: "", salary: "", advance: "", absence: "", due: "Açık", status: "Yeni", workerId: "", worker: "", ...materialState("") };
   };
   const [form, setForm] = useState(initialForm);
   const [formError, setFormError] = useState("");
@@ -1314,7 +1706,7 @@ function EntryModal({ kind: initialKind, edit, date, onClose, onSave, paymentMet
     });
     setFormError("");
   };
-  const labels = { sales: "Satış", expenses: "Gider", matExpenses: "Malzeme gideri", production: "Üretim", stock: "Stok", workers: "Çalışan", debts: "Borç" };
+  const labels = { sales: "Satış", expenses: "Gider", matExpenses: "Malzeme gideri", production: "Üretim", stock: "Stok", workers: "Çalışan", debts: "Borç", creditSales: "Vadeli satış" };
   const splitPayment = isSplitPayment(form.payment);
   const paymentOptions = paymentMethods.includes(form.payment) || !form.payment ? paymentMethods : [form.payment, ...paymentMethods];
   const submit = (event) => {
@@ -1323,11 +1715,15 @@ function EntryModal({ kind: initialKind, edit, date, onClose, onSave, paymentMet
       setFormError("Nakit ve Havale / EFT toplamı, kayıt toplamına eşit olmalıdır.");
       return;
     }
+    if (form.kind === "creditSales") {
+      if (!(toNumber(form.amount) > 0)) { setFormError("Toplam tutar sıfırdan büyük olmalıdır."); return; }
+      if (toNumber(form.downPayment) - toNumber(form.amount) > 1e-9) { setFormError("Peşinat toplam tutarı aşamaz."); return; }
+    }
     onSave(form);
   };
   return <Modal title={edit ? `${labels[form.kind]} kaydını düzenle` : `Yeni ${labels[form.kind].toLowerCase()} kaydı`} onClose={onClose} wide>
     <form className="modal-form" onSubmit={submit}>
-      <div className="form-grid two"><label>Kayıt türü<select value={form.kind} disabled={Boolean(edit)} onChange={update("kind")}><option value="sales">Satış</option><option value="expenses">Gider</option><option value="matExpenses">Malzeme gideri</option><option value="production">Üretim</option><option value="stock">Stok hareketi</option><option value="workers">Çalışan</option><option value="debts">Borç</option></select></label><label>Tarih<input type="date" value={form.date || date} onChange={update("date")}/></label></div>
+      <div className="form-grid two"><label>Kayıt türü<select value={form.kind} disabled={Boolean(edit)} onChange={update("kind")}><option value="sales">Satış</option><option value="creditSales">Vadeli satış</option><option value="expenses">Gider</option><option value="matExpenses">Malzeme gideri</option><option value="production">Üretim</option><option value="stock">Stok hareketi</option><option value="workers">Çalışan</option><option value="debts">Borç</option></select></label><label>Tarih<input type="date" value={form.date || date} onChange={update("date")}/></label></div>
       {form.kind === "sales" && <div className="form-grid two">
         <label>Müşteri<input required value={form.name} onChange={update("name")} placeholder="Müşteri adı"/></label>
         <MaterialField label="Malzeme / ürün" materials={materials} form={form} update={update}/>
@@ -1357,7 +1753,17 @@ function EntryModal({ kind: initialKind, edit, date, onClose, onSave, paymentMet
       {form.kind === "production" && <div className="form-grid two"><MaterialField label="Üretim malzemesi / ürünü" materials={materials} form={form} update={update}/><label>Palet<input type="number" step="any" value={form.pallets} onChange={update("pallets")} placeholder="0"/></label><label>Adet<input type="number" step="any" value={form.qty} onChange={update("qty")} placeholder="0"/></label><label>Fire (adet)<input type="number" step="any" value={form.broken} onChange={update("broken")} placeholder="0"/></label><label>Kullanılan hammadde<input type="number" step="any" value={form.cement} onChange={update("cement")} placeholder="0"/></label><label>Kalan hammadde<input type="number" step="any" value={form.remaining} onChange={update("remaining")} placeholder="0"/></label></div>}
       {form.kind === "stock" && <div className="form-grid two"><MaterialField label="Malzeme" materials={materials} form={form} update={update}/><label>Renk<select value={form.color || ""} onChange={update("color")}>{!form.color && <option value="">Seçiniz</option>}{[...new Set([...(colors || []), form.color].filter(Boolean))].map((color) => <option key={color} value={color}>{color}</option>)}</select></label><label>Stok miktarı<input type="number" step="any" value={form.qty} onChange={update("qty")} placeholder="0"/></label><label>Birim<input value={form.unit} onChange={update("unit")} placeholder="adet"/></label></div>}
       {form.kind === "workers" && <div className="form-grid two"><label>Çalışan adı<input required value={form.name} onChange={update("name")} placeholder="Ad soyad"/></label><label>Maaş tutarı<input type="number" step="any" value={form.salary} onChange={update("salary")} placeholder="0,00"/></label><label>Avans<input type="number" step="any" value={form.advance} onChange={update("advance")} placeholder="0,00"/></label><label>Devamsızlık (gün)<input type="number" step="any" value={form.absence} onChange={update("absence")} placeholder="0"/></label></div>}
-      {form.kind === "debts" && <div className="form-grid two"><label>Borç türü<select value={form.direction || "owed"} onChange={update("direction")}><option value="owed">Alınan borç (biz ödeyeceğiz)</option><option value="lent">Verilen borç (tahsil edeceğiz)</option></select></label><label>{form.direction === "lent" ? "Borçlu" : "Alacaklı"}<input required value={form.name} onChange={update("name")} placeholder={form.direction === "lent" ? "Borçlu adı" : "Alacaklı adı"}/></label><label>Kaynak / açıklama<input value={form.description} onChange={update("description")} placeholder="Borç kaynağı"/></label><label>Toplam borç<input required type="number" min="0" step="any" value={form.amount} onChange={update("amount")} placeholder="0,00"/><small className="field-hint">Ödeme ve tahsilatlar, kayıt sonrası listedeki Öde / Tahsilat tuşuyla işlenir.</small></label><label>Vade<input value={form.due} onChange={update("due")} placeholder="Açık / 31 Ağu"/></label></div>}
+      {form.kind === "creditSales" && <div className="form-grid two">
+        <label>Müşteri<input required value={form.name} onChange={update("name")} placeholder="Müşteri adı" list="credit-customer-list"/><datalist id="credit-customer-list">{customers.map((item) => <option key={item} value={item}/>)}</datalist></label>
+        <MaterialField label="Malzeme / ürün" materials={materials} form={form} update={update}/>
+        <label>Adet<input type="number" min="0" step="any" value={form.qty} onChange={update("qty")} placeholder="0"/></label>
+        <label>Toplam tutar<input required type="number" min="0" step="any" value={form.amount} onChange={update("amount")} placeholder="0,00"/></label>
+        <label>Peşinat<input type="number" min="0" step="any" value={form.downPayment} onChange={update("downPayment")} placeholder="0,00"/><small className="field-hint">Satış anında alınan tutar; kalan tahsilata düşer.</small></label>
+        <label>Peşinat ödeme tipi<select value={form.payment} onChange={update("payment")}>{paymentOptions.map((method) => <option key={method} value={method}>{method}</option>)}</select></label>
+        <label>Vade<input value={form.due} onChange={update("due")} placeholder="Açık / 31 Ağu"/></label>
+        <label>Fatura no<input value={form.invoice} onChange={update("invoice")} placeholder="O/000"/></label>
+      </div>}
+      {form.kind === "debts" && <div className="form-grid two"><label>Alacaklı<input required value={form.name} onChange={update("name")} placeholder="Alacaklı adı"/></label><label>Kaynak / açıklama<input value={form.description} onChange={update("description")} placeholder="Borç kaynağı"/></label><label>Toplam borç<input required type="number" min="0" step="any" value={form.amount} onChange={update("amount")} placeholder="0,00"/><small className="field-hint">Ödemeler, kayıt sonrası listedeki Öde tuşuyla işlenir.</small></label><label>Vade<input value={form.due} onChange={update("due")} placeholder="Açık / 31 Ağu"/></label></div>}
       {formError && <div className="form-error" role="alert">{formError}</div>}
       <div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>Vazgeç</button><button className="button primary" type="submit"><Icon name="check" size={16}/> {edit ? "Değişiklikleri kaydet" : "Kaydı oluştur"}</button></div>
     </form>

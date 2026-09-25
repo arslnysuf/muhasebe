@@ -87,3 +87,13 @@ button { cursor:pointer; }
 .txn-amount{white-space:nowrap;color:#28454c;font-size:11px}
 .debt-detail-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px}
 @media (max-width:720px){.pay-summary{grid-template-columns:repeat(2,1fr)}.progress-cell{min-width:110px}}
+.metric-icon.teal{color:#2c8173;background:var(--teal-soft)}
+@media (min-width:1400px){.metric-grid{grid-template-columns:repeat(5,1fr)}}
+.customer-groups{display:flex;flex-direction:column;gap:10px;padding:14px 20px 20px}
+.customer-groups .worker-month-head strong{font-size:12px}
+.customer-sale-side{display:flex;flex-direction:column;align-items:flex-end;gap:6px;flex:none}
+.customer-sale-actions{display:flex;align-items:center;gap:4px}
+.alloc-row input{width:120px;flex:none;height:34px;margin:0;padding:0 9px;border:1px solid #e1e9e9;border-radius:7px;font-size:11px;color:var(--ink)}
+.alloc-row input:focus{border-color:#86c8bd;box-shadow:0 0 0 3px #e6f5f1;outline:none}
+.alloc-row .txn-amount{min-width:96px;text-align:right}
+@media (max-width:720px){.alloc-row{flex-wrap:wrap}.alloc-row input{width:100%}.customer-groups{padding:12px 14px 16px}}
